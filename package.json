@@ -1,0 +1,20 @@
+{
+  "name": "refind-switcher",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:linux": "tauri build --bundles deb,rpm,appimage",
+    "build:mac-intel": "tauri build --target x86_64-apple-darwin",
+    "build:mac-arm": "tauri build --target aarch64-apple-darwin",
+    "build:mac-universal": "tauri build --target universal-apple-darwin"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

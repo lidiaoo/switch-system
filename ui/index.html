@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>rEFInd 启动切换器</title>
+    <link href="./styles.css" rel="stylesheet" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>rEFInd 启动切换器</h1>
+        <p id="status">正在扫描 rEFInd 变量目录…</p>
+      </header>
+
+      <section aria-label="可启动系统" id="systems"></section>
+
+      <section class="directory">
+        <label for="vars-dir">变量目录</label>
+        <input id="vars-dir" placeholder="留空则自动扫描 EFI/refind/vars" spellcheck="false" type="text" />
+        <div class="actions">
+          <button id="use-directory" type="button">使用此目录</button>
+          <button class="secondary" id="refresh" type="button">刷新</button>
+        </div>
+      </section>
+
+      <p id="message" role="status"></p>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
+

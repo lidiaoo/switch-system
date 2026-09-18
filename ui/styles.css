@@ -1,0 +1,132 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #141922;
+  color: #e7ebf2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+}
+
+main {
+  display: grid;
+  gap: 20px;
+  padding: 24px;
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+#status {
+  margin: 0;
+  color: #a5b0c2;
+  font-size: 14px;
+}
+
+#systems {
+  display: grid;
+  gap: 10px;
+}
+
+.system-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border: 1px solid #2c3544;
+  border-radius: 10px;
+  background: #1b222e;
+}
+
+.system-card.active {
+  border-color: #61a5f2;
+  background: #182637;
+}
+
+.system-card.unavailable {
+  opacity: 0.45;
+}
+
+.system-name {
+  display: grid;
+  gap: 3px;
+}
+
+.system-name strong {
+  font-size: 15px;
+}
+
+.system-name small {
+  color: #97a3b6;
+}
+
+button {
+  border: 0;
+  border-radius: 7px;
+  padding: 9px 13px;
+  background: #2f7fe0;
+  color: white;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #3d8dee;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+button.secondary {
+  background: #333d4d;
+}
+
+button.secondary:hover:not(:disabled) {
+  background: #3f4b5e;
+}
+
+.directory {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid #2c3544;
+}
+
+label {
+  font-size: 13px;
+  color: #a5b0c2;
+}
+
+input {
+  border: 1px solid #364153;
+  border-radius: 7px;
+  padding: 10px 12px;
+  background: #101620;
+  color: #e7ebf2;
+  font: inherit;
+  font-size: 13px;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+#message {
+  min-height: 20px;
+  margin: 0;
+  color: #f0b073;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
