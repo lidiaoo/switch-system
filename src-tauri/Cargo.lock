@@ -2522,6 +2522,7 @@ name = "refind-switcher"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-service-management",

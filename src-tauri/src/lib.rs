@@ -45,7 +45,7 @@ struct ActiveMount {
 
 impl ActiveMount {
     fn unmount(self) -> io::Result<()> {
-        Command::new("umount")
+        mount_command("umount")
             .arg(&self.mountpoint)
             .status()
             .and_then(|status| {
@@ -60,9 +60,9 @@ impl ActiveMount {
     }
 
     fn remount(&self, mode: &str) -> io::Result<()> {
-        let output = Command::new("mount")
+        let output = mount_command("mount")
             .arg("-o")
-            .arg(format!("remount,{mode}"))
+            .arg(remount_options(mode))
             .arg(&self.device)
             .arg(&self.mountpoint)
             .output()?;
@@ -74,6 +74,105 @@ impl ActiveMount {
             ))
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_command(program: &str) -> Command {
+    if is_root() {
+        Command::new(program)
+    } else {
+        let mut command = Command::new("pkexec");
+        command.arg(program);
+        command
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_command(program: &str) -> Command {
+    Command::new(program)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_user_home_by_name(username: &str) -> Option<PathBuf> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.first() != Some(&username) {
+            return None;
+        }
+        Some(PathBuf::from(fields.get(5)?.to_string()))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_user_home_by_uid(uid: u32) -> Option<PathBuf> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.get(2).and_then(|value| value.parse::<u32>().ok()) != Some(uid) {
+            return None;
+        }
+        Some(PathBuf::from(fields.get(5)?.to_string()))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_invoking_user_home() -> Option<PathBuf> {
+    if let Some(username) = std::env::var_os("SUDO_USER") {
+        return linux_user_home_by_name(&username.to_string_lossy());
+    }
+    if let Ok(uid) = std::env::var("PKEXEC_UID") {
+        return uid.parse::<u32>().ok().and_then(linux_user_home_by_uid);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_user_ids() -> Option<(u32, u32)> {
+    if is_root() {
+        return linux_invoking_user_home().and_then(linux_user_ids_from_home);
+    }
+    Some(unsafe { (libc::getuid(), libc::getgid()) })
+}
+
+#[cfg(target_os = "linux")]
+fn mount_options(mode: &str) -> String {
+    match linux_mount_user_ids() {
+        Some((uid, gid)) => format!("{mode},uid={uid},gid={gid}"),
+        None => mode.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remount_options(mode: &str) -> String {
+    format!("remount,{}", mount_options(mode))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remount_options(mode: &str) -> String {
+    format!("remount,{mode}")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_user_ids_from_home(home: &Path) -> Option<(u32, u32)> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.get(5) != Some(&home.to_string_lossy()) {
+            return None;
+        }
+        Some((fields.get(2)?.parse().ok()?, fields.get(3)?.parse().ok()?))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_options(mode: &str) -> String {
+    mode.to_string()
 }
 
 #[derive(Clone, Serialize)]
@@ -359,8 +458,8 @@ fn scan_unmounted_partition() -> Result<ScanResult, String> {
     fs::create_dir(&mountpoint).map_err(|error| format!("无法创建临时挂载点: {error}"))?;
 
     for (_, device, filesystem) in candidates {
-        let result = Command::new("mount")
-            .args(["-o", "ro", "-t", &filesystem])
+        let result = mount_command("mount")
+            .args(["-o", &mount_options("ro"), "-t", &filesystem])
             .arg(&device)
             .arg(&mountpoint)
             .output();
@@ -382,7 +481,7 @@ fn scan_unmounted_partition() -> Result<ScanResult, String> {
                         variables,
                     });
                 }
-                let _ = Command::new("umount").arg(&mountpoint).status();
+                let _ = mount_command("umount").arg(&mountpoint).status();
             }
             Ok(output) => {
                 let _ = format!(
@@ -395,8 +494,8 @@ fn scan_unmounted_partition() -> Result<ScanResult, String> {
     }
     let _ = fs::remove_dir(&mountpoint);
 
-    let root_hint = if cfg!(unix) {
-        "；如分区未挂载，请以 root 运行应用"
+    let root_hint = if cfg!(target_os = "linux") {
+        "；应用已尝试通过 pkexec 临时提权挂载，若取消授权或 pkexec 不可用，请手动挂载后刷新"
     } else {
         ""
     };
@@ -876,7 +975,12 @@ fn autostart_state(app: &AppHandle) -> AutostartState {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn autostart_state(app: &AppHandle) -> AutostartState {
+    linux_autostart_state(app)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn autostart_state(app: &AppHandle) -> AutostartState {
     legacy_autostart_state(app)
 }
@@ -890,9 +994,82 @@ fn autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, Strin
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
+    linux_autostart_set(app, enabled)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
     legacy_autostart_set(app, enabled)
+}
+#[cfg(target_os = "linux")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_file(app: &AppHandle) -> Result<PathBuf, String> {
+    let invoking_user = if is_root() {
+        linux_invoking_user_home()
+    } else {
+        Some(
+            app.path()
+                .home_dir()
+                .map_err(|error| format!("无法定位用户主目录: {error}"))?,
+        )
+    };
+    let home = invoking_user.ok_or_else(|| "无法识别当前登录用户".to_string())?;
+    let directory = home.join(".config").join("autostart");
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建自启动目录: {error}"))?;
+    let name = app.package_info().name.replace([' ', '/'], "-");
+    Ok(directory.join(format!("{name}.desktop")))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_state(app: &AppHandle) -> AutostartState {
+    match linux_autostart_file(app) {
+        Ok(path) if path.exists() => AutostartState::Enabled,
+        Ok(_) => AutostartState::Disabled,
+        Err(_) => AutostartState::Unavailable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
+    let path = linux_autostart_file(app)?;
+    if path.exists() {
+        let stale = fs::read_to_string(&path)
+            .map(|contents| {
+                !contents.contains("rEFInd Switcher") && !contents.contains("refind-switcher")
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    if !enabled {
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| format!("无法关闭开机启动: {error}"))?;
+        }
+        return Ok(AutostartState::Disabled);
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("无法定位当前程序: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("无法解析当前程序路径: {error}"))?;
+    let appimage = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let launch_path = appimage.unwrap_or(executable);
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={}\nComment=rEFInd Switcher\nExec={} --from-autostart\nStartupNotify=false\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        app.package_info().name,
+        shell_quote(&launch_path.to_string_lossy())
+    );
+    fs::write(&path, content).map_err(|error| format!("无法写入用户自启动项: {error}"))?;
+    Ok(AutostartState::Enabled)
 }
 
 /// 早期版本在 macOS 上写入 ~/Library/LaunchAgents 实现开机启动，
@@ -1084,6 +1261,8 @@ pub fn run() {
                 let state = app.state::<Mutex<Settings>>();
                 *state.lock().expect("settings mutex poisoned") = settings;
             }
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             startup_autostart_sync(app.handle());
             view_settings(app.handle());
             if stored_settings(app.handle()).start_in_tray {

@@ -5,6 +5,7 @@
 ## 功能
 
 - Windows / Linux / macOS 系统托盘菜单直接切换下次启动系统。
+- 主窗口不占用 Windows 任务栏、Linux 任务栏或 macOS Dock，仅通过系统托盘常驻。
 - 开机启动开关：登录系统后自动启动并常驻托盘。
 - 可配置点击窗口 ❌ 时是最小化到托盘还是退出程序。
 - Linux 提供 `deb`、`rpm` 和 `AppImage`；macOS 支持 Intel、Apple Silicon 和通用二进制。
@@ -17,12 +18,15 @@
 
 ## 应用设置
 
-主窗口「应用设置」区域提供两项开关：
+主窗口「应用设置」区域提供以下设置：
 
 - **开机启动**：登录系统后自动启动应用。
   - macOS 13 及以上调用系统登录项接口 `SMAppService.mainApp` 注册，条目会出现在「系统设置 → 通用 → 登录项与扩展 → 登入时打开」，应用更新或被移动位置后启动时会自动重新注册；macOS 12 及以下回退为 `~/Library/LaunchAgents/rEFInd Switcher.plist`（早期版本写入的 LaunchAgent 会在启动时自动清理）。
   - Windows 写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 写入 `~/.config/autostart`。
+  - Linux 即使以 root 执行，也会识别 `SUDO_USER` / `PKEXEC_UID`，并把 desktop 文件写回实际登录用户的 `~/.config/autostart`。
+  - Linux 通用二进制/AppImage 的路径会被写入 desktop 文件；桌面会话启动该程序后仍以当前登录用户运行。
   - 若系统返回「需要批准」（`requiresApproval`），主窗口会给出提示和「打开登录项与扩展设置」按钮，在系统设置里勾选即可。
+- **启动时隐藏主界面**：登录/启动后只在托盘待命，不直接打开主窗口。
 - **点击窗口 ❌ 时**：`最小化到托盘`（隐藏主窗口继续后台运行，托盘菜单「显示主窗口」可恢复）或 `退出程序`（同时退出托盘）。
 
 设置持久化在应用配置目录的 `settings.json` 中。开机启动以系统真实状态为准：在系统设置／登录项里手动修改后，重新打开主窗口会自动同步显示。
@@ -62,7 +66,7 @@ npm run build:mac-arm
 npm run build:mac-universal
 ```
 
-Linux 包必须在 Linux 环境生成；macOS 包必须在 macOS 环境生成。
+Linux 包必须在 Linux 环境生成；macOS 包必须在 macOS 环境生成。请先在目标平台安装 Tauri 2 所需的系统依赖（Linux 需要 WebKit/GTK、AppImage 工具链等），再运行对应命令。
 
 ## 构建产物
 
@@ -80,7 +84,7 @@ Linux 包必须在 Linux 环境生成；macOS 包必须在 macOS 环境生成。
 写入 ESP 中的 rEFInd 变量文件需要管理员/root 权限。
 
 - Windows：请以管理员身份运行应用；开发时也需要在管理员终端执行 `npm run tauri dev`。
-- Linux：如 ESP 未挂载，应用需要挂载权限，请以 root 或授权用户运行；已挂载且可写时不要求 root。
+- Linux：应用默认以普通用户运行。ESP 未挂载时，会通过 `pkexec` 弹出系统授权并临时挂载分区（可用授权用户密码）；挂载选项会绑定到实际登录用户。已挂载且可写时不要求 root，也不再要求整个应用以 root 启动。
 - macOS：如果 ESP 未挂载，需要先用系统工具挂载，或在主窗口指定已挂载的变量目录。
 
 > Linux GNOME 默认没有传统系统托盘。如果托盘图标未显示，需要启用支持 StatusNotifierItem 的扩展，或使用主窗口操作。
