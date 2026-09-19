@@ -130,3 +130,93 @@ input {
   font-size: 13px;
   white-space: pre-wrap;
 }
+
+.settings {
+  display: grid;
+  gap: 12px;
+  padding-top: 16px;
+  border-top: 1px solid #2c3544;
+}
+
+.settings h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+label.setting {
+  cursor: pointer;
+}
+
+.setting-text {
+  display: grid;
+  gap: 2px;
+}
+
+.setting-text strong {
+  color: #e7ebf2;
+  font-size: 14px;
+}
+
+.setting-text small {
+  color: #97a3b6;
+  font-size: 12px;
+}
+
+.setting input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  accent-color: #2f7fe0;
+}
+
+select {
+  border: 1px solid #364153;
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: #101620;
+  color: #e7ebf2;
+  font: inherit;
+  font-size: 13px;
+}
+
+.setting :disabled {
+  opacity: 0.55;
+}
+
+#settings-message {
+  min-height: 16px;
+  margin: 0;
+  color: #97a3b6;
+  font-size: 12px;
+}
+
+.setting-state {
+  color: #6f7d92;
+}
+
+.link {
+  justify-self: start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #4f9bff;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.link:hover:not(:disabled) {
+  background: none;
+  color: #7cb6ff;
+}
+
+.hidden {
+  display: none;
+}

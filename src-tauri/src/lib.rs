@@ -15,6 +15,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const SOURCE_FILES: [(&str, &str, &str); 3] = [
     ("linux", "Linux", "PreviousBoot-linux"),
@@ -23,6 +24,8 @@ const SOURCE_FILES: [(&str, &str, &str); 3] = [
 ];
 const ESP_PARTTYPE: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 const FAT_FILESYSTEMS: [&str; 6] = ["vfat", "fat", "fat12", "fat16", "fat32", "exfat"];
+const SETTINGS_FILE: &str = "settings.json";
+const MAIN_WINDOW_LABEL: &str = "main";
 
 #[derive(Default)]
 struct AppState {
@@ -91,6 +94,93 @@ struct AppStatus {
     variables: Vec<VariableInfo>,
     message: String,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CloseAction {
+    Tray,
+    Quit,
+}
+
+impl CloseAction {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tray" => Some(Self::Tray),
+            "quit" => Some(Self::Quit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Settings {
+    autostart: bool,
+    close_action: CloseAction,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            autostart: false,
+            close_action: CloseAction::Tray,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutostartState {
+    Enabled,
+    RequiresApproval,
+    Disabled,
+    Unavailable,
+}
+
+impl AutostartState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::RequiresApproval => "requires-approval",
+            Self::Disabled => "disabled",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn is_on(self) -> bool {
+        matches!(self, Self::Enabled | Self::RequiresApproval)
+    }
+
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::RequiresApproval => {
+                Some("已注册登录项，请在「系统设置 → 通用 → 登录项与扩展」中允许本应用")
+            }
+            Self::Unavailable => Some(
+                "无法通过系统登录项接口管理开机启动（需以 .app 形式运行），可在「系统设置 → 通用 → 登录项与扩展」中手动添加",
+            ),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsView {
+    #[serde(flatten)]
+    settings: Settings,
+    autostart_state: &'static str,
+    autostart_hint: Option<String>,
+}
+
+impl SettingsView {
+    fn new(settings: Settings, state: AutostartState) -> Self {
+        Self {
+            settings,
+            autostart_state: state.as_str(),
+            autostart_hint: state.hint().map(str::to_string),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -600,6 +690,8 @@ fn update_tray_menu(app: &AppHandle) -> tauri::Result<()> {
     }
     let second_separator = PredefinedMenuItem::separator(app)?;
     menu.append(&second_separator)?;
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    menu.append(&show)?;
     let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
     menu.append(&refresh)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -625,6 +717,261 @@ fn spawn_menu_action(app: &AppHandle, action: &str) {
         }
         _ => {}
     });
+}
+
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用配置目录: {error}"))?;
+    Ok(directory.join(SETTINGS_FILE))
+}
+
+fn read_settings_file(app: &AppHandle) -> Settings {
+    settings_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn write_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    let path = settings_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "设置文件路径无效".to_string())?;
+    fs::create_dir_all(directory).map_err(|error| format!("无法创建配置目录: {error}"))?;
+    let contents = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("无法序列化设置: {error}"))?;
+    let temporary = temporary_target(&path);
+    let result = (|| -> io::Result<()> {
+        fs::write(&temporary, contents.as_bytes())?;
+        fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| format!("无法保存设置: {error}"))
+}
+
+fn stored_settings(app: &AppHandle) -> Settings {
+    let state = app.state::<Mutex<Settings>>();
+    let settings = state.lock().expect("settings mutex poisoned").clone();
+    settings
+}
+
+fn save_settings(app: &AppHandle, settings: &Settings) -> Result<Settings, String> {
+    write_settings_file(app, settings)?;
+    let state = app.state::<Mutex<Settings>>();
+    *state.lock().expect("settings mutex poisoned") = settings.clone();
+    Ok(settings.clone())
+}
+
+/// macOS 13+ 使用系统登录项（SMAppService），开机启动会出现在
+/// 「系统设置 → 通用 → 登录项与扩展 → 登入时打开」里。
+#[cfg(target_os = "macos")]
+mod login_item {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyClass;
+    use objc2_service_management::{SMAppService, SMAppServiceStatus};
+
+    use super::AutostartState;
+
+    pub fn is_supported() -> bool {
+        AnyClass::get(c"SMAppService").is_some()
+    }
+
+    fn main_app() -> Result<Retained<SMAppService>, String> {
+        if !is_supported() {
+            return Err("当前系统版本不支持登录项（需要 macOS 13 及以上）".to_string());
+        }
+        Ok(unsafe { SMAppService::mainAppService() })
+    }
+
+    pub fn state() -> AutostartState {
+        let Ok(service) = main_app() else {
+            eprintln!("SMAppService 类不可用（macOS 低于 13）");
+            return AutostartState::Unavailable;
+        };
+        let status = unsafe { service.status() };
+        if status == SMAppServiceStatus::Enabled {
+            AutostartState::Enabled
+        } else if status == SMAppServiceStatus::RequiresApproval {
+            AutostartState::RequiresApproval
+        } else if status == SMAppServiceStatus::NotRegistered {
+            AutostartState::Disabled
+        } else {
+            AutostartState::Unavailable
+        }
+    }
+
+    pub fn set(enabled: bool) -> Result<AutostartState, String> {
+        let service = main_app()?;
+        let result = unsafe {
+            if enabled {
+                service.registerAndReturnError()
+            } else {
+                service.unregisterAndReturnError()
+            }
+        };
+        let state = state();
+        match result {
+            Ok(()) => Ok(state),
+            Err(error) => {
+                let already_there = if enabled {
+                    state.is_on()
+                } else {
+                    state == AutostartState::Disabled
+                };
+                if already_there {
+                    return Ok(state);
+                }
+                let action = if enabled { "开启" } else { "关闭" };
+                Err(format!(
+                    "无法{action}开机启动: {}",
+                    error.localizedDescription()
+                ))
+            }
+        }
+    }
+
+    pub fn open_system_settings() -> Result<(), String> {
+        main_app()?;
+        unsafe { SMAppService::openSystemSettingsLoginItems() };
+        Ok(())
+    }
+}
+
+fn legacy_autostart_state(app: &AppHandle) -> AutostartState {
+    match app.autolaunch().is_enabled() {
+        Ok(true) => AutostartState::Enabled,
+        Ok(false) => AutostartState::Disabled,
+        Err(_) => AutostartState::Unavailable,
+    }
+}
+
+fn legacy_autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
+    let manager = app.autolaunch();
+    let action = if enabled { "开启" } else { "关闭" };
+    if enabled {
+        manager
+            .enable()
+            .map_err(|error| format!("无法{action}开机启动: {error}"))?;
+    } else {
+        manager
+            .disable()
+            .map_err(|error| format!("无法{action}开机启动: {error}"))?;
+    }
+    Ok(legacy_autostart_state(app))
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_state(app: &AppHandle) -> AutostartState {
+    if login_item::is_supported() {
+        login_item::state()
+    } else {
+        legacy_autostart_state(app)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn autostart_state(app: &AppHandle) -> AutostartState {
+    legacy_autostart_state(app)
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
+    if login_item::is_supported() {
+        login_item::set(enabled)
+    } else {
+        legacy_autostart_set(app, enabled)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
+    legacy_autostart_set(app, enabled)
+}
+
+/// 早期版本在 macOS 上写入 ~/Library/LaunchAgents 实现开机启动，
+/// 改用系统登录项后需要清理，否则登录时会被重复拉起。
+#[cfg(target_os = "macos")]
+fn remove_legacy_launch_agents(app: &AppHandle) {
+    let Ok(home) = app.path().home_dir() else {
+        return;
+    };
+    let directory = home.join("Library").join("LaunchAgents");
+    let name = app.package_info().name.clone();
+    let identifier = app.config().identifier.clone();
+    let candidates = [
+        format!("{name}.plist"),
+        format!("{}.plist", name.replace(' ', "-")),
+        format!("{identifier}.plist"),
+    ];
+    for file in candidates {
+        let path = directory.join(&file);
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !contents.contains("refind-switcher") && !contents.contains(&name) {
+            continue;
+        }
+        let _ = Command::new("launchctl")
+            .arg("unload")
+            .arg("--")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = fs::remove_file(&path);
+    }
+}
+
+fn view_settings(app: &AppHandle) -> SettingsView {
+    let state = autostart_state(app);
+    let mut settings = stored_settings(app);
+    if settings.autostart != state.is_on() {
+        settings.autostart = state.is_on();
+        settings = save_settings(app, &settings).unwrap_or(settings);
+    }
+    SettingsView::new(settings, state)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_legacy_autostart(app: &AppHandle) {
+    if login_item::is_supported() {
+        remove_legacy_launch_agents(app);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_legacy_autostart(_app: &AppHandle) {}
+
+/// 应用被更新或移动后，登录项可能失效；启动时按已保存的设置自愈一次。
+fn startup_autostart_sync(app: &AppHandle) {
+    cleanup_legacy_autostart(app);
+    let desired = stored_settings(app).autostart;
+    let state = autostart_state(app);
+    eprintln!(
+        "启动时检查开机启动：设置={desired}，系统状态={}",
+        state.as_str()
+    );
+    if desired && state == AutostartState::Disabled {
+        match autostart_set(app, true) {
+            Ok(new_state) => eprintln!("已重新注册开机启动登录项，状态: {}", new_state.as_str()),
+            Err(error) => eprintln!("重新注册开机启动登录项失败: {error}"),
+        }
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 #[tauri::command]
@@ -655,15 +1002,87 @@ fn switch_system(app: AppHandle, system: String) -> AppStatus {
     switch_and_update(&app, &system)
 }
 
+#[tauri::command]
+fn get_settings(app: AppHandle) -> SettingsView {
+    view_settings(&app)
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<SettingsView, String> {
+    let state = autostart_set(&app, enabled)?;
+    let mut settings = stored_settings(&app);
+    settings.autostart = state.is_on();
+    let settings = save_settings(&app, &settings)?;
+    Ok(SettingsView::new(settings, state))
+}
+
+#[tauri::command]
+fn open_login_items_settings(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &app;
+        login_item::open_system_settings()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &app;
+        Err("仅 macOS 支持打开登录项设置".to_string())
+    }
+}
+
+#[tauri::command]
+fn set_close_action(app: AppHandle, action: String) -> Result<SettingsView, String> {
+    let Some(close_action) = CloseAction::parse(action.trim()) else {
+        return Err(format!("未知的关闭行为: {action}"));
+    };
+    let mut settings = stored_settings(&app);
+    settings.close_action = close_action;
+    save_settings(&app, &settings)?;
+    Ok(view_settings(&app))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::<AppState>::default())
+        .manage(Mutex::<Settings>::default())
+        // macOS 13+ 走系统登录项（见 login_item），这里的 LaunchAgent 方式仅作为
+        // 旧版 macOS 以及 Windows / Linux 的实现。
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+            let app = window.app_handle().clone();
+            api.prevent_close();
+            if stored_settings(&app).close_action == CloseAction::Quit {
+                app.exit(0);
+                return;
+            }
+            let _ = window.hide();
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        })
         .setup(|app| {
+            let settings = read_settings_file(app.handle());
+            {
+                let state = app.state::<Mutex<Settings>>();
+                *state.lock().expect("settings mutex poisoned") = settings;
+            }
+            startup_autostart_sync(app.handle());
+            view_settings(app.handle());
+
             let status =
                 MenuItem::with_id(app.handle(), "status", "正在扫描…", false, None::<&str>)?;
+            let show = MenuItem::with_id(app.handle(), "show", "显示主窗口", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app.handle(), "refresh", "刷新", true, None::<&str>)?;
             let quit = MenuItem::with_id(app.handle(), "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app.handle(), &[&status, &refresh, &quit])?;
+            let menu = Menu::with_items(app.handle(), &[&status, &show, &refresh, &quit])?;
 
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(create_tray_image())
@@ -671,6 +1090,10 @@ pub fn run() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| {
                     let action = event.id().as_ref().to_string();
+                    if action == "show" {
+                        show_main_window(app);
+                        return;
+                    }
                     spawn_menu_action(app, &action);
                 })
                 .build(app.handle())?;
@@ -683,7 +1106,11 @@ pub fn run() {
             current_status,
             refresh,
             set_vars_dir,
-            switch_system
+            switch_system,
+            get_settings,
+            set_autostart,
+            open_login_items_settings,
+            set_close_action
         ])
         .run(tauri::generate_context!())
         .expect("failed to run rEFInd Switcher");

@@ -5,6 +5,8 @@
 ## 功能
 
 - Windows / Linux / macOS 系统托盘菜单直接切换下次启动系统。
+- 开机启动开关：登录系统后自动启动并常驻托盘。
+- 可配置点击窗口 ❌ 时是最小化到托盘还是退出程序。
 - Linux 提供 `deb`、`rpm` 和 `AppImage`；macOS 支持 Intel、Apple Silicon 和通用二进制。
 - 自动扫描已挂载的 `EFI/refind/vars` 目录。
 - Linux 支持通过 `lsblk` 查找未挂载的 FAT/ESP 分区并临时只读挂载；写入前会重新挂载为读写，写完再恢复只读。
@@ -12,6 +14,18 @@
 - 写入使用同目录临时文件、原子替换和 SHA-256 校验。
 - `PreviousBoot-linux/windows/mac` 仅作为模板读取，应用不会修改这三个模板文件。
 - 内置 Windows/macOS/Linux 打包图标。
+
+## 应用设置
+
+主窗口「应用设置」区域提供两项开关：
+
+- **开机启动**：登录系统后自动启动应用。
+  - macOS 13 及以上调用系统登录项接口 `SMAppService.mainApp` 注册，条目会出现在「系统设置 → 通用 → 登录项与扩展 → 登入时打开」，应用更新或被移动位置后启动时会自动重新注册；macOS 12 及以下回退为 `~/Library/LaunchAgents/rEFInd Switcher.plist`（早期版本写入的 LaunchAgent 会在启动时自动清理）。
+  - Windows 写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 写入 `~/.config/autostart`。
+  - 若系统返回「需要批准」（`requiresApproval`），主窗口会给出提示和「打开登录项与扩展设置」按钮，在系统设置里勾选即可。
+- **点击窗口 ❌ 时**：`最小化到托盘`（隐藏主窗口继续后台运行，托盘菜单「显示主窗口」可恢复）或 `退出程序`（同时退出托盘）。
+
+设置持久化在应用配置目录的 `settings.json` 中。开机启动以系统真实状态为准：在系统设置／登录项里手动修改后，重新打开主窗口会自动同步显示。
 
 ## 环境要求
 

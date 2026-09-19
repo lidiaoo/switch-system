@@ -24,6 +24,32 @@
         </div>
       </section>
 
+      <section aria-label="应用设置" class="settings">
+        <h2>应用设置</h2>
+        <label class="setting">
+          <span class="setting-text">
+            <strong>开机启动</strong>
+            <small>登录系统后自动启动，常驻托盘待命</small>
+            <small class="setting-state" id="autostart-state"></small>
+          </span>
+          <input id="autostart" type="checkbox" />
+        </label>
+        <div class="setting">
+          <span class="setting-text">
+            <strong>点击窗口 ❌ 时</strong>
+            <small>可在托盘菜单「显示主窗口」中重新打开</small>
+          </span>
+          <select id="close-action">
+            <option value="tray">最小化到托盘</option>
+            <option value="quit">退出程序</option>
+          </select>
+        </div>
+        <p id="settings-message" role="status"></p>
+        <button class="link hidden" id="login-items" type="button">
+          打开「登录项与扩展」设置
+        </button>
+      </section>
+
       <p id="message" role="status"></p>
     </main>
     <script src="./app.js"></script>
