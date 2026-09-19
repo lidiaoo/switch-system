@@ -135,7 +135,7 @@ fn linux_invoking_user_home() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn linux_mount_user_ids() -> Option<(u32, u32)> {
     if is_root() {
-        return linux_invoking_user_home().and_then(linux_user_ids_from_home);
+        return linux_invoking_user_home().as_deref().and_then(linux_user_ids_from_home);
     }
     Some(unsafe { (libc::getuid(), libc::getgid()) })
 }
@@ -163,7 +163,7 @@ fn linux_user_ids_from_home(home: &Path) -> Option<(u32, u32)> {
     let passwd = fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
         let fields = line.split(':').collect::<Vec<_>>();
-        if fields.get(5) != Some(&home.to_string_lossy()) {
+        if fields.get(5) != Some(&home.to_string_lossy().as_ref()) {
             return None;
         }
         Some((fields.get(2)?.parse().ok()?, fields.get(3)?.parse().ok()?))
