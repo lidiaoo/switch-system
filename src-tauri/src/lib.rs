@@ -117,6 +117,7 @@ impl CloseAction {
 #[serde(default, rename_all = "camelCase")]
 struct Settings {
     autostart: bool,
+    start_in_tray: bool,
     close_action: CloseAction,
 }
 
@@ -124,6 +125,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             autostart: false,
+            start_in_tray: false,
             close_action: CloseAction::Tray,
         }
     }
@@ -1041,6 +1043,14 @@ fn set_close_action(app: AppHandle, action: String) -> Result<SettingsView, Stri
     Ok(view_settings(&app))
 }
 
+#[tauri::command]
+fn set_start_in_tray(app: AppHandle, enabled: bool) -> Result<SettingsView, String> {
+    let mut settings = stored_settings(&app);
+    settings.start_in_tray = enabled;
+    save_settings(&app, &settings)?;
+    Ok(view_settings(&app))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::<AppState>::default())
@@ -1076,6 +1086,13 @@ pub fn run() {
             }
             startup_autostart_sync(app.handle());
             view_settings(app.handle());
+            if stored_settings(app.handle()).start_in_tray {
+                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                    let _ = window.hide();
+                }
+                #[cfg(target_os = "macos")]
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
 
             let status =
                 MenuItem::with_id(app.handle(), "status", "正在扫描…", false, None::<&str>)?;
@@ -1110,7 +1127,8 @@ pub fn run() {
             get_settings,
             set_autostart,
             open_login_items_settings,
-            set_close_action
+            set_close_action,
+            set_start_in_tray
         ])
         .run(tauri::generate_context!())
         .expect("failed to run rEFInd Switcher");

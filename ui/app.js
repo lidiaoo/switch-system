@@ -1,4 +1,5 @@
 const invoke = window.__TAURI__.core.invoke;
+const startInTrayElement = document.querySelector("#start-in-tray");
 const listen = window.__TAURI__.event.listen;
 
 const statusElement = document.querySelector("#status");
@@ -95,6 +96,7 @@ document.querySelector("#use-directory").addEventListener("click", async () => {
 
 function renderSettings(settings, fallbackMessage = "") {
   autostartElement.checked = Boolean(settings.autostart);
+  startInTrayElement.checked = Boolean(settings.startInTray);
   closeActionElement.value = settings.closeAction === "quit" ? "quit" : "tray";
   autostartStateElement.textContent =
     autostartStateLabels.get(settings.autostartState) || "";
@@ -108,6 +110,7 @@ function renderSettings(settings, fallbackMessage = "") {
 
 function setSettingsBusy(busy) {
   autostartElement.disabled = busy;
+  startInTrayElement.disabled = busy;
   closeActionElement.disabled = busy;
 }
 
@@ -137,6 +140,13 @@ autostartElement.addEventListener("change", () =>
     "set_autostart",
     { enabled: autostartElement.checked },
     autostartElement.checked ? "已开启开机启动" : "已关闭开机启动",
+  ));
+
+startInTrayElement.addEventListener("change", () =>
+  saveSettings(
+    "set_start_in_tray",
+    { enabled: startInTrayElement.checked },
+    startInTrayElement.checked ? "已设置：启动时隐藏主界面" : "已设置：启动时显示主界面",
   ));
 
 closeActionElement.addEventListener("change", () =>
