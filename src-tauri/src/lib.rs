@@ -274,6 +274,20 @@ impl AutostartState {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn running_from_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.canonicalize().ok())
+        .and_then(|executable| executable.ancestors().nth(3).map(Path::to_path_buf))
+        .is_some_and(|bundle| {
+            bundle
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+                && bundle.join("Contents").is_dir()
+        })
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView {
@@ -1149,8 +1163,9 @@ mod login_item {
                 }
                 let action = if enabled { "开启" } else { "关闭" };
                 Err(format!(
-                    "无法{action}开机启动: {}",
-                    error.localizedDescription()
+                    "无法{action}开机启动: {} (code={})",
+                    error.localizedDescription(),
+                    error.code()
                 ))
             }
         }
@@ -1160,6 +1175,24 @@ mod login_item {
         main_app()?;
         unsafe { SMAppService::openSystemSettingsLoginItems() };
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_autostart_state(app: &AppHandle) -> AutostartState {
+    if login_item::is_supported() && running_from_app_bundle() {
+        login_item::state()
+    } else {
+        legacy_autostart_state(app)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
+    if login_item::is_supported() && running_from_app_bundle() {
+        login_item::set(enabled)
+    } else {
+        legacy_autostart_set(app, enabled)
     }
 }
 
@@ -1188,11 +1221,7 @@ fn legacy_autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState
 
 #[cfg(target_os = "macos")]
 fn autostart_state(app: &AppHandle) -> AutostartState {
-    if login_item::is_supported() {
-        login_item::state()
-    } else {
-        legacy_autostart_state(app)
-    }
+    macos_autostart_state(app)
 }
 
 #[cfg(target_os = "linux")]
@@ -1207,11 +1236,7 @@ fn autostart_state(app: &AppHandle) -> AutostartState {
 
 #[cfg(target_os = "macos")]
 fn autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
-    if login_item::is_supported() {
-        login_item::set(enabled)
-    } else {
-        legacy_autostart_set(app, enabled)
-    }
+    macos_autostart_set(app, enabled)
 }
 
 #[cfg(target_os = "linux")]
@@ -1338,7 +1363,7 @@ fn view_settings(app: &AppHandle) -> SettingsView {
 
 #[cfg(target_os = "macos")]
 fn cleanup_legacy_autostart(app: &AppHandle) {
-    if login_item::is_supported() {
+    if macos_autostart_state(app) == AutostartState::Enabled {
         remove_legacy_launch_agents(app);
     }
 }
@@ -1442,6 +1467,7 @@ fn toggle_autostart_setting(app: &AppHandle) {
             let _ = update_tray_menu(app);
         }
         Err(error) => {
+            let _ = update_tray_menu(app);
             eprintln!("切换开机启动失败: {error}");
         }
     }
