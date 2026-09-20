@@ -904,24 +904,7 @@ fn atomic_copy(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 fn create_tray_image() -> Image<'static> {
-    let mut rgba = Vec::with_capacity(64 * 64 * 4);
-    for y in 0..64 {
-        for x in 0..64 {
-            let border = x < 3 || y < 3 || x >= 61 || y >= 61;
-            let edge = (9..13).contains(&x) || (29..33).contains(&x) || (51..55).contains(&x);
-            let color = if border || edge {
-                [31, 38, 50, 255]
-            } else if x < 29 {
-                [243, 83, 37, 255]
-            } else if x < 51 {
-                [129, 188, 6, 255]
-            } else {
-                [5, 166, 240, 255]
-            };
-            rgba.extend_from_slice(&color);
-        }
-    }
-    Image::new_owned(rgba, 64, 64)
+    tauri::include_image!("icons/icon.png")
 }
 
 fn update_tray_menu(app: &AppHandle) -> tauri::Result<()> {
