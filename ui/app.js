@@ -9,6 +9,7 @@ const directoryElement = document.querySelector("#vars-dir");
 const messageElement = document.querySelector("#message");
 const autostartElement = document.querySelector("#autostart");
 const closeActionElement = document.querySelector("#close-action");
+const unmountTemporaryElement = document.querySelector("#unmount-temporary");
 const settingsMessageElement = document.querySelector("#settings-message");
 const autostartStateElement = document.querySelector("#autostart-state");
 const loginItemsElement = document.querySelector("#login-items");
@@ -35,6 +36,7 @@ function render(status) {
   statusElement.textContent = status.message;
   messageElement.textContent = status.error || "";
   directoryElement.value = status.varsDir || "";
+  unmountTemporaryElement.classList.toggle("hidden", !status.temporaryMount);
   systemsElement.replaceChildren();
 
   for (const item of status.variables) {
@@ -92,6 +94,18 @@ document.querySelector("#use-directory").addEventListener("click", async () => {
     render(await invoke("set_vars_dir", { path: path || null }));
   } catch (error) {
     messageElement.textContent = String(error);
+  }
+});
+
+unmountTemporaryElement.addEventListener("click", async () => {
+  unmountTemporaryElement.disabled = true;
+  statusElement.textContent = "正在卸载临时挂载…";
+  try {
+    render(await invoke("unmount_temporary"));
+  } catch (error) {
+    messageElement.textContent = String(error);
+  } finally {
+    unmountTemporaryElement.disabled = false;
   }
 });
 

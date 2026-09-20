@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{
     image::Image,
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
-    tray::TrayIconBuilder,
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
@@ -196,6 +196,7 @@ struct VariableInfo {
 #[serde(rename_all = "camelCase")]
 struct AppStatus {
     vars_dir: Option<PathBuf>,
+    temporary_mount: bool,
     variables: Vec<VariableInfo>,
     message: String,
     error: Option<String>,
@@ -635,7 +636,7 @@ fn scan_unmounted_partition() -> Result<ScanResult, String> {
     let _ = fs::remove_dir(&mountpoint);
 
     let root_hint = if cfg!(target_os = "linux") {
-        "；应用已尝试通过 pkexec 临时提权挂载，若取消授权或 pkexec 不可用，请手动挂载后刷新"
+        "；应用已尝试通过 pkexec 临时提权挂载，若取消授权或 pkexec 不可用，请手动挂载后再扫描"
     } else {
         ""
     };
@@ -696,6 +697,7 @@ fn state_snapshot(app: &AppHandle) -> AppStatus {
     let state = state.lock().expect("state mutex poisoned");
     AppStatus {
         vars_dir: state.vars_dir.as_deref().map(display_path),
+        temporary_mount: state.active_mount.as_ref().is_some_and(|mount| mount.owned),
         variables: state.variables.clone(),
         message: state.message.clone(),
         error: state.error.clone(),
@@ -726,6 +728,10 @@ fn refresh_and_update(app: &AppHandle) -> AppStatus {
                 .unwrap_or_else(|| "已连接 rEFInd；PreviousBoot 未匹配模板".to_string());
             let status = AppStatus {
                 vars_dir: Some(display_path(&result.vars_dir)),
+                temporary_mount: result
+                    .active_mount
+                    .as_ref()
+                    .is_some_and(|mount| mount.owned),
                 variables: result.variables.clone(),
                 message: message.clone(),
                 error: None,
@@ -743,6 +749,7 @@ fn refresh_and_update(app: &AppHandle) -> AppStatus {
             let message = "未找到可用的 rEFInd 变量目录".to_string();
             let status = AppStatus {
                 vars_dir: None,
+                temporary_mount: false,
                 variables: Vec::new(),
                 message: message.clone(),
                 error: Some(error),
@@ -772,6 +779,11 @@ fn switch_and_update(app: &AppHandle, system: &str) -> AppStatus {
     let Some((_system, display_name, source_name)) = selected else {
         let mut status = state_snapshot(app);
         status.error = Some(format!("未知系统: {system}"));
+        status.temporary_mount = {
+            let state = app.state::<Mutex<AppState>>();
+            let state = state.lock().expect("state mutex poisoned");
+            state.active_mount.as_ref().is_some_and(|mount| mount.owned)
+        };
         return status;
     };
 
@@ -837,6 +849,11 @@ fn update_failure_status(app: &AppHandle, message: &str, error: String) -> AppSt
     };
     let status = AppStatus {
         vars_dir: existing_directory,
+        temporary_mount: {
+            let state = app.state::<Mutex<AppState>>();
+            let state = state.lock().expect("state mutex poisoned");
+            state.active_mount.as_ref().is_some_and(|mount| mount.owned)
+        },
         variables: existing_variables,
         message: message.to_string(),
         error: Some(error),
@@ -908,11 +925,13 @@ fn create_tray_image() -> Image<'static> {
 }
 
 fn update_tray_menu(app: &AppHandle) -> tauri::Result<()> {
-    let (message, variables, error) = {
+    let (message, temporary_mount, settings, variables, error) = {
         let state = app.state::<Mutex<AppState>>();
         let state = state.lock().expect("state mutex poisoned");
         (
             state.message.clone(),
+            state.active_mount.as_ref().is_some_and(|mount| mount.owned),
+            stored_settings(app),
             state.variables.clone(),
             state.error.clone(),
         )
@@ -941,18 +960,61 @@ fn update_tray_menu(app: &AppHandle) -> tauri::Result<()> {
     }
     let second_separator = PredefinedMenuItem::separator(app)?;
     menu.append(&second_separator)?;
+    if temporary_mount {
+        let unmount =
+            MenuItem::with_id(app, "unmount-temporary", "卸载临时挂载", true, None::<&str>)?;
+        menu.append(&unmount)?;
+    }
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     menu.append(&show)?;
+    let settings_separator = PredefinedMenuItem::separator(app)?;
+    menu.append(&settings_separator)?;
+    let settings_label = MenuItem::with_id(app, "settings-label", "应用设置", false, None::<&str>)?;
+    menu.append(&settings_label)?;
+    let autostart = CheckMenuItem::with_id(
+        app,
+        "setting-autostart",
+        "开机启动",
+        true,
+        settings.autostart,
+        None::<&str>,
+    )?;
+    menu.append(&autostart)?;
+    let start_in_tray = CheckMenuItem::with_id(
+        app,
+        "setting-start-in-tray",
+        "启动时隐藏主界面",
+        true,
+        settings.start_in_tray,
+        None::<&str>,
+    )?;
+    menu.append(&start_in_tray)?;
     let hide_from_dock_taskbar = CheckMenuItem::with_id(
         app,
-        "hide-from-dock-taskbar",
+        "setting-hide-from-dock-taskbar",
         "隐藏程序（任务栏/Dock）",
         true,
-        stored_settings(app).hide_from_dock_taskbar,
+        settings.hide_from_dock_taskbar,
         None::<&str>,
     )?;
     menu.append(&hide_from_dock_taskbar)?;
-    let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
+    let close_action_menu = Submenu::with_id(app, "setting-close-action", "点击窗口 ❌ 时", true)?;
+    for (action, label) in [
+        (CloseAction::Tray, "最小化到托盘"),
+        (CloseAction::Quit, "退出程序"),
+    ] {
+        let item = CheckMenuItem::with_id(
+            app,
+            format!("setting-close-action:{action:?}").to_lowercase(),
+            label,
+            true,
+            settings.close_action == action,
+            None::<&str>,
+        )?;
+        close_action_menu.append(&item)?;
+    }
+    menu.append(&close_action_menu)?;
+    let refresh = MenuItem::with_id(app, "refresh", "扫描", true, None::<&str>)?;
     menu.append(&refresh)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     menu.append(&quit)?;
@@ -971,15 +1033,21 @@ fn spawn_menu_action(app: &AppHandle, action: &str) {
         "refresh" => {
             refresh_and_update(&app);
         }
-        "hide-from-dock-taskbar" => {
-            let enabled = !stored_settings(&app).hide_from_dock_taskbar;
-            let mut settings = stored_settings(&app);
-            settings.hide_from_dock_taskbar = enabled;
-            if save_settings(&app, &settings).is_ok()
-                && apply_dock_taskbar_visibility(&app, enabled).is_ok()
-            {
-                let _ = update_tray_menu(&app);
-            }
+        "unmount-temporary" => {
+            unmount_temporary(app);
+        }
+        "setting-autostart" => toggle_autostart_setting(&app),
+        action if action.starts_with("setting-") && action.ends_with(":true") => {
+            update_tray_setting(&app, action.strip_suffix(":true").unwrap(), true);
+        }
+        action if action.starts_with("setting-") && action.ends_with(":false") => {
+            update_tray_setting(&app, action.strip_suffix(":false").unwrap(), false);
+        }
+        action if action.starts_with("setting-close-action:") => {
+            update_close_action_setting(
+                &app,
+                action.strip_prefix("setting-close-action:").unwrap(),
+            );
         }
         "quit" => app.exit(0),
         "linux" | "windows" | "macos" => {
@@ -1324,6 +1392,110 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+#[tauri::command]
+fn unmount_temporary(app: AppHandle) -> AppStatus {
+    let mount = {
+        let state = app.state::<Mutex<AppState>>();
+        let mut state = state.lock().expect("state mutex poisoned");
+        state
+            .active_mount
+            .take_if(|mount| mount.owned)
+            .map(|mount| mount.clone())
+    };
+
+    let Some(mount) = mount else {
+        let mut status = state_snapshot(&app);
+        status.message = "没有应用创建的临时挂载".to_string();
+        status.error = None;
+        publish_status(&app, &status);
+        return status;
+    };
+
+    let mountpoint = mount.mountpoint.clone();
+
+    let status = match mount.clone().unmount() {
+        Ok(()) => {
+            let state = app.state::<Mutex<AppState>>();
+            let mut state = state.lock().expect("state mutex poisoned");
+            state.vars_dir = None;
+            state.variables = Vec::new();
+            state.message = "已卸载应用创建的临时挂载".to_string();
+            state.error = None;
+            AppStatus {
+                vars_dir: None,
+                temporary_mount: false,
+                variables: Vec::new(),
+                message: state.message.clone(),
+                error: None,
+            }
+        }
+        Err(error) => {
+            {
+                let state = app.state::<Mutex<AppState>>();
+                let mut state = state.lock().expect("state mutex poisoned");
+                state.active_mount = Some(mount);
+            }
+            let mut status = state_snapshot(&app);
+            status.message = "卸载临时挂载失败".to_string();
+            status.error = Some(format!("无法卸载 {}: {error}", mountpoint.display()));
+            status
+        }
+    };
+    update_tray_menu(&app)
+        .map_err(|error| error.to_string())
+        .ok();
+    publish_status(&app, &status);
+    status
+}
+
+fn toggle_autostart_setting(app: &AppHandle) {
+    let enabled = !stored_settings(app).autostart;
+    match autostart_set(app, enabled).and_then(|state| {
+        let mut settings = stored_settings(app);
+        settings.autostart = state.is_on();
+        save_settings(app, &settings)
+    }) {
+        Ok(_) => {
+            let _ = update_tray_menu(app);
+        }
+        Err(error) => {
+            eprintln!("切换开机启动失败: {error}");
+        }
+    }
+}
+
+fn update_tray_setting(app: &AppHandle, action: &str, enabled: bool) {
+    let mut settings = stored_settings(app);
+    match action {
+        "setting-start-in-tray" => settings.start_in_tray = enabled,
+        "setting-hide-from-dock-taskbar" => settings.hide_from_dock_taskbar = enabled,
+        _ => return,
+    }
+    let apply_result = match action {
+        "setting-hide-from-dock-taskbar" => apply_dock_taskbar_visibility(app, enabled),
+        _ => Ok(()),
+    };
+    match save_settings(app, &settings).and_then(|_| apply_result) {
+        Ok(()) => {
+            let _ = update_tray_menu(app);
+        }
+        Err(error) => {
+            eprintln!("切换应用设置失败: {error}");
+        }
+    }
+}
+
+fn update_close_action_setting(app: &AppHandle, action: &str) {
+    let Some(close_action) = CloseAction::parse(action.trim()) else {
+        return;
+    };
+    let mut settings = stored_settings(app);
+    settings.close_action = close_action;
+    if save_settings(app, &settings).is_ok() {
+        let _ = update_tray_menu(app);
+    }
+}
+
 fn apply_dock_taskbar_visibility(app: &AppHandle, hide: bool) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         window
@@ -1484,14 +1656,25 @@ pub fn run() {
             let status =
                 MenuItem::with_id(app.handle(), "status", "正在扫描…", false, None::<&str>)?;
             let show = MenuItem::with_id(app.handle(), "show", "显示主窗口", true, None::<&str>)?;
-            let refresh = MenuItem::with_id(app.handle(), "refresh", "刷新", true, None::<&str>)?;
+            let refresh = MenuItem::with_id(app.handle(), "refresh", "扫描", true, None::<&str>)?;
             let quit = MenuItem::with_id(app.handle(), "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app.handle(), &[&status, &show, &refresh, &quit])?;
 
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(create_tray_image())
                 .menu(&menu)
-                .show_menu_on_left_click(true)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        show_main_window(app);
+                    }
+                })
                 .on_menu_event(|app, event| {
                     let action = event.id().as_ref().to_string();
                     if action == "show" {
@@ -1511,6 +1694,7 @@ pub fn run() {
             refresh,
             set_vars_dir,
             switch_system,
+            unmount_temporary,
             get_settings,
             set_autostart,
             open_login_items_settings,

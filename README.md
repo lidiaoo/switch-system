@@ -31,6 +31,18 @@
 
 设置持久化在应用配置目录的 `settings.json` 中。开机启动以系统真实状态为准：在系统设置／登录项里手动修改后，重新打开主窗口会自动同步显示。
 
+Linux 中除“开机启动”外，其他应用设置保存失败或恢复原值时，先检查应用配置目录是否属于当前用户：
+
+```bash
+ls -ld ~/.config/com.example.refind-switcher
+```
+
+如果目录所有者显示为 `root`，通常是此前以 `sudo` 或 `pkexec` 运行过应用导致的。恢复属主后重新启动应用：
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.config/com.example.refind-switcher
+```
+
 ## 环境要求
 
 - Node.js 18+
@@ -68,8 +80,6 @@ npm run build:mac-universal
 
 Linux 包必须在 Linux 环境生成；macOS 包必须在 macOS 环境生成。请先在目标平台安装 Tauri 2 所需的系统依赖（Linux 需要 WebKit/GTK、AppImage 工具链等），再运行对应命令。
 
-如果 AppImage 打包阶段出现 `strip: unknown type [0x13] section '.relr.dyn'` 或 `failed to run linuxdeploy`，可先使用 `NO_STRIP=1 npm run build:linux` 跳过 `linuxdeploy` 的 strip 步骤。该环境变量仅影响本次命令，不会修改项目配置。
-
 ## 构建产物
 
 所有构建与打包只使用默认目录 `src-tauri/target`，不要再指定 `--target-dir` 或设置 `CARGO_TARGET_DIR`（此前 Windows 侧产生的 `src-tauri/target-new` 已废弃）。
@@ -89,7 +99,35 @@ Linux 包必须在 Linux 环境生成；macOS 包必须在 macOS 环境生成。
 - Linux：应用默认以普通用户运行。ESP 未挂载时，会通过 `pkexec` 弹出系统授权并临时挂载分区（可用授权用户密码）；挂载选项会绑定到实际登录用户。已挂载且可写时不要求 root，也不再要求整个应用以 root 启动。
 - macOS：如果 ESP 未挂载，需要先用系统工具挂载，或在主窗口指定已挂载的变量目录。
 
-> Linux GNOME 默认没有传统系统托盘。如果托盘图标未显示，需要启用支持 StatusNotifierItem 的扩展，或使用主窗口操作。
+> Linux GNOME 默认没有传统系统托盘。如果托盘图标未显示，需要启用支持 StatusNotifierItem 的扩展，或使用主窗口操作。Linux AppIndicator 不支持区分托盘左键/右键，主菜单仍通过托盘菜单中的「显示主窗口」打开；Windows/macOS 支持左键打开主窗口、右键弹出菜单。
+
+## 常见问题
+
+### AppImage 打包失败
+
+如果打包阶段出现 `strip: unknown type [0x13] section '.relr.dyn'` 或 `failed to run linuxdeploy`，可使用以下命令跳过 `linuxdeploy` 的 strip 步骤：
+
+```bash
+NO_STRIP=1 npm run build:linux
+```
+
+该环境变量仅影响本次命令，不会修改项目配置。
+
+### Linux 应用设置保存失败
+
+如果除“开机启动”外，其他勾选框和选择框保存后恢复原值，先检查应用配置目录是否属于当前用户：
+
+```bash
+ls -ld ~/.config/com.example.refind-switcher
+```
+
+如果目录所有者显示为 `root`，通常是此前以 `sudo` 或 `pkexec` 运行过应用导致的。恢复属主后重新启动应用：
+
+```bash
+sudo chown -R "$(id -un):$(id -gn)" ~/.config/com.example.refind-switcher
+```
+
+开机启动写入 `~/.config/autostart`，因此在该问题下仍可能正常工作。
 
 ## 注意
 
