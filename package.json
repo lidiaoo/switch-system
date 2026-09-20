@@ -11,9 +11,9 @@
     "build": "tauri build",
     "build:linux": "tauri build --bundles deb,rpm,appimage",
     "build:win": "tauri build --bundles nsis,msi",
-    "build:mac-intel": "tauri build --target x86_64-apple-darwin",
-    "build:mac-arm": "tauri build --target aarch64-apple-darwin",
-    "build:mac-universal": "tauri build --target universal-apple-darwin"
+    "build:mac-intel": "env -u CARGO CC=/usr/bin/clang CXX=/usr/bin/clang++ AR=/usr/bin/ar tauri build --target x86_64-apple-darwin",
+    "build:mac-arm": "env -u CARGO CC=/usr/bin/clang CXX=/usr/bin/clang++ AR=/usr/bin/ar tauri build --target aarch64-apple-darwin",
+    "build:mac-universal": "env -u CARGO CC=/usr/bin/clang CXX=/usr/bin/clang++ AR=/usr/bin/ar tauri build --target universal-apple-darwin"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0"
