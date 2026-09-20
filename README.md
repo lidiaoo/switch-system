@@ -68,6 +68,8 @@ npm run build:mac-universal
 
 Linux 包必须在 Linux 环境生成；macOS 包必须在 macOS 环境生成。请先在目标平台安装 Tauri 2 所需的系统依赖（Linux 需要 WebKit/GTK、AppImage 工具链等），再运行对应命令。
 
+如果 AppImage 打包阶段出现 `strip: unknown type [0x13] section '.relr.dyn'` 或 `failed to run linuxdeploy`，可先使用 `NO_STRIP=1 npm run build:linux` 跳过 `linuxdeploy` 的 strip 步骤。该环境变量仅影响本次命令，不会修改项目配置。
+
 ## 构建产物
 
 所有构建与打包只使用默认目录 `src-tauri/target`，不要再指定 `--target-dir` 或设置 `CARGO_TARGET_DIR`（此前 Windows 侧产生的 `src-tauri/target-new` 已废弃）。
