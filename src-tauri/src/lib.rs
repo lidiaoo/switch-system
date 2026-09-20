@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager,
 };
@@ -41,10 +41,14 @@ struct AppState {
 struct ActiveMount {
     device: PathBuf,
     mountpoint: PathBuf,
+    owned: bool,
 }
 
 impl ActiveMount {
     fn unmount(self) -> io::Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
         mount_command("umount")
             .arg(&self.mountpoint)
             .status()
@@ -135,7 +139,9 @@ fn linux_invoking_user_home() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn linux_mount_user_ids() -> Option<(u32, u32)> {
     if is_root() {
-        return linux_invoking_user_home().as_deref().and_then(linux_user_ids_from_home);
+        return linux_invoking_user_home()
+            .as_deref()
+            .and_then(linux_user_ids_from_home);
     }
     Some(unsafe { (libc::getuid(), libc::getgid()) })
 }
@@ -217,6 +223,7 @@ impl CloseAction {
 struct Settings {
     autostart: bool,
     start_in_tray: bool,
+    hide_from_dock_taskbar: bool,
     close_action: CloseAction,
 }
 
@@ -225,6 +232,7 @@ impl Default for Settings {
         Self {
             autostart: false,
             start_in_tray: false,
+            hide_from_dock_taskbar: true,
             close_action: CloseAction::Tray,
         }
     }
@@ -303,6 +311,12 @@ struct ScanResult {
     vars_dir: PathBuf,
     active_mount: Option<ActiveMount>,
     variables: Vec<VariableInfo>,
+}
+
+#[derive(Clone)]
+struct MountedScanCandidate {
+    vars_dir: PathBuf,
+    active_mount: Option<ActiveMount>,
 }
 
 fn file_hash(path: &Path) -> io::Result<String> {
@@ -401,6 +415,131 @@ fn mounted_candidate_directories() -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(path: &str) -> PathBuf {
+    let mut decoded = String::with_capacity(path.len());
+    let mut characters = path.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let mut escape = String::new();
+            for _ in 0..3 {
+                if let Some(digit) = characters.next() {
+                    escape.push(digit);
+                }
+            }
+            if let Ok(byte) = u8::from_str_radix(&escape, 8) {
+                decoded.push(byte as char);
+                continue;
+            }
+            decoded.push(character);
+            decoded.push_str(&escape);
+        } else {
+            decoded.push(character);
+        }
+    }
+    PathBuf::from(decoded)
+}
+
+#[cfg(target_os = "linux")]
+fn is_owned_mountpoint(mountpoint: &Path) -> bool {
+    let temp_dir = std::env::temp_dir();
+    mountpoint.starts_with(&temp_dir)
+        && mountpoint
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("refind-switcher-"))
+}
+
+#[cfg(target_os = "linux")]
+fn mounted_scan_candidates() -> Vec<MountedScanCandidate> {
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for line in mountinfo.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(mountpoint) = fields.get(4) else {
+            continue;
+        };
+        let Some(options) = fields.get(5) else {
+            continue;
+        };
+        let Some(separator) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        let Some(fstype) = fields.get(separator + 1) else {
+            continue;
+        };
+        let Some(device) = fields.get(separator + 2) else {
+            continue;
+        };
+        if !FAT_FILESYSTEMS.contains(fstype) {
+            continue;
+        }
+
+        let mountpoint = decode_mountinfo_path(mountpoint);
+        let vars_dir = mountpoint.join("EFI/refind/vars");
+        let Ok(resolved) = vars_dir.canonicalize() else {
+            continue;
+        };
+        if !resolved.is_dir()
+            || candidates
+                .iter()
+                .any(|candidate: &MountedScanCandidate| candidate.vars_dir == resolved)
+        {
+            continue;
+        }
+
+        let read_only = options.split(',').any(|option| option == "ro");
+        let owned = is_owned_mountpoint(&mountpoint);
+        let active_mount = if owned || read_only {
+            Some(ActiveMount {
+                device: decode_mountinfo_path(device),
+                mountpoint,
+                owned,
+            })
+        } else {
+            None
+        };
+        candidates.push(MountedScanCandidate {
+            vars_dir: resolved,
+            active_mount,
+        });
+    }
+    candidates
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mounted_scan_candidates() -> Vec<MountedScanCandidate> {
+    mounted_candidate_directories()
+        .into_iter()
+        .map(|vars_dir| MountedScanCandidate {
+            vars_dir,
+            active_mount: None,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn active_mount_for_directory(directory: &Path, resolved_directory: &Path) -> Option<ActiveMount> {
+    mounted_scan_candidates()
+        .into_iter()
+        .filter_map(|candidate| candidate.active_mount)
+        .find(|mount| {
+            resolved_directory.starts_with(&mount.mountpoint)
+                || directory.starts_with(&mount.mountpoint)
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn active_mount_for_directory(
+    _directory: &Path,
+    _resolved_directory: &Path,
+) -> Option<ActiveMount> {
+    None
+}
+
 fn scan_unmounted_partition() -> Result<ScanResult, String> {
     if !cfg!(target_os = "linux") {
         return Err("未找到已挂载的 EFI/refind/vars 目录".to_string());
@@ -477,6 +616,7 @@ fn scan_unmounted_partition() -> Result<ScanResult, String> {
                         active_mount: Some(ActiveMount {
                             device: PathBuf::from(device),
                             mountpoint,
+                            owned: true,
                         }),
                         variables,
                     });
@@ -509,20 +649,30 @@ fn scan_vars_directory(explicit_dir: Option<&Path>) -> Result<ScanResult, String
         if !directory.is_dir() {
             return Err(format!("rEFInd 变量目录不存在: {}", directory.display()));
         }
-        let variables =
-            inspect_variables(directory).map_err(|error| format!("无法读取变量目录: {error}"))?;
+        let resolved_directory = directory
+            .canonicalize()
+            .unwrap_or_else(|_| directory.to_path_buf());
+        let variables = inspect_variables(&resolved_directory)
+            .map_err(|error| format!("无法读取变量目录: {error}"))?;
         return Ok(ScanResult {
-            vars_dir: directory.to_path_buf(),
-            active_mount: None,
+            vars_dir: resolved_directory.clone(),
+            active_mount: active_mount_for_directory(directory, &resolved_directory),
             variables,
         });
     }
 
-    let candidates = mounted_candidate_directories();
+    let mut candidates = mounted_scan_candidates();
+    candidates.sort_by_key(|candidate| {
+        candidate
+            .active_mount
+            .as_ref()
+            .map(|mount| !mount.owned)
+            .unwrap_or(true)
+    });
     if candidates.len() > 1 {
         let names = candidates
             .iter()
-            .map(|path| format!("  {}", path.display()))
+            .map(|candidate| format!("  {}", candidate.vars_dir.display()))
             .collect::<Vec<_>>()
             .join("\n");
         return Err(format!(
@@ -530,11 +680,11 @@ fn scan_vars_directory(explicit_dir: Option<&Path>) -> Result<ScanResult, String
         ));
     }
     if let Some(directory) = candidates.first() {
-        let variables =
-            inspect_variables(directory).map_err(|error| format!("无法读取变量目录: {error}"))?;
+        let variables = inspect_variables(&directory.vars_dir)
+            .map_err(|error| format!("无法读取变量目录: {error}"))?;
         return Ok(ScanResult {
-            vars_dir: directory.clone(),
-            active_mount: None,
+            vars_dir: directory.vars_dir.clone(),
+            active_mount: directory.active_mount.clone(),
             variables,
         });
     }
@@ -793,6 +943,15 @@ fn update_tray_menu(app: &AppHandle) -> tauri::Result<()> {
     menu.append(&second_separator)?;
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     menu.append(&show)?;
+    let hide_from_dock_taskbar = CheckMenuItem::with_id(
+        app,
+        "hide-from-dock-taskbar",
+        "隐藏程序（任务栏/Dock）",
+        true,
+        stored_settings(app).hide_from_dock_taskbar,
+        None::<&str>,
+    )?;
+    menu.append(&hide_from_dock_taskbar)?;
     let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
     menu.append(&refresh)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -811,6 +970,16 @@ fn spawn_menu_action(app: &AppHandle, action: &str) {
     std::thread::spawn(move || match action.as_str() {
         "refresh" => {
             refresh_and_update(&app);
+        }
+        "hide-from-dock-taskbar" => {
+            let enabled = !stored_settings(&app).hide_from_dock_taskbar;
+            let mut settings = stored_settings(&app);
+            settings.hide_from_dock_taskbar = enabled;
+            if save_settings(&app, &settings).is_ok()
+                && apply_dock_taskbar_visibility(&app, enabled).is_ok()
+            {
+                let _ = update_tray_menu(&app);
+            }
         }
         "quit" => app.exit(0),
         "linux" | "windows" | "macos" => {
@@ -1145,12 +1314,31 @@ fn startup_autostart_sync(app: &AppHandle) {
 
 fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
-    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    if !stored_settings(app).hide_from_dock_taskbar {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    }
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn apply_dock_taskbar_visibility(app: &AppHandle, hide: bool) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        window
+            .set_skip_taskbar(hide)
+            .map_err(|error| format!("无法更新任务栏显示状态: {error}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    let _macos_policy_updated = app
+        .set_activation_policy(if hide {
+            tauri::ActivationPolicy::Accessory
+        } else {
+            tauri::ActivationPolicy::Regular
+        })
+        .map_err(|error| format!("无法更新 Dock 显示状态: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1228,6 +1416,16 @@ fn set_start_in_tray(app: AppHandle, enabled: bool) -> Result<SettingsView, Stri
     Ok(view_settings(&app))
 }
 
+#[tauri::command]
+fn set_hide_from_dock_taskbar(app: AppHandle, enabled: bool) -> Result<SettingsView, String> {
+    let mut settings = stored_settings(&app);
+    settings.hide_from_dock_taskbar = enabled;
+    save_settings(&app, &settings)?;
+    apply_dock_taskbar_visibility(&app, enabled)?;
+    update_tray_menu(&app).map_err(|error| error.to_string())?;
+    Ok(view_settings(&app))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::<AppState>::default())
@@ -1265,12 +1463,22 @@ pub fn run() {
             let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             startup_autostart_sync(app.handle());
             view_settings(app.handle());
-            if stored_settings(app.handle()).start_in_tray {
+            let hide_from_dock_taskbar = stored_settings(app.handle()).hide_from_dock_taskbar;
+            let start_in_tray = stored_settings(app.handle()).start_in_tray;
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(if hide_from_dock_taskbar || start_in_tray {
+                tauri::ActivationPolicy::Accessory
+            } else {
+                tauri::ActivationPolicy::Regular
+            });
+            apply_dock_taskbar_visibility(app.handle(), hide_from_dock_taskbar)
+                .map_err(|error| error.to_string())?;
+            if start_in_tray {
                 if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                     let _ = window.hide();
                 }
-                #[cfg(target_os = "macos")]
-                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            } else {
+                show_main_window(app.handle());
             }
 
             let status =
@@ -1307,7 +1515,8 @@ pub fn run() {
             set_autostart,
             open_login_items_settings,
             set_close_action,
-            set_start_in_tray
+            set_start_in_tray,
+            set_hide_from_dock_taskbar
         ])
         .run(tauri::generate_context!())
         .expect("failed to run rEFInd Switcher");

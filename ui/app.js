@@ -1,5 +1,6 @@
 const invoke = window.__TAURI__.core.invoke;
 const startInTrayElement = document.querySelector("#start-in-tray");
+const hideFromDockTaskbarElement = document.querySelector("#hide-from-dock-taskbar");
 const listen = window.__TAURI__.event.listen;
 
 const statusElement = document.querySelector("#status");
@@ -97,6 +98,7 @@ document.querySelector("#use-directory").addEventListener("click", async () => {
 function renderSettings(settings, fallbackMessage = "") {
   autostartElement.checked = Boolean(settings.autostart);
   startInTrayElement.checked = Boolean(settings.startInTray);
+  hideFromDockTaskbarElement.checked = Boolean(settings.hideFromDockTaskbar);
   closeActionElement.value = settings.closeAction === "quit" ? "quit" : "tray";
   autostartStateElement.textContent =
     autostartStateLabels.get(settings.autostartState) || "";
@@ -111,6 +113,7 @@ function renderSettings(settings, fallbackMessage = "") {
 function setSettingsBusy(busy) {
   autostartElement.disabled = busy;
   startInTrayElement.disabled = busy;
+  hideFromDockTaskbarElement.disabled = busy;
   closeActionElement.disabled = busy;
 }
 
@@ -147,6 +150,15 @@ startInTrayElement.addEventListener("change", () =>
     "set_start_in_tray",
     { enabled: startInTrayElement.checked },
     startInTrayElement.checked ? "已设置：启动时隐藏主界面" : "已设置：启动时显示主界面",
+  ));
+
+hideFromDockTaskbarElement.addEventListener("change", () =>
+  saveSettings(
+    "set_hide_from_dock_taskbar",
+    { enabled: hideFromDockTaskbarElement.checked },
+    hideFromDockTaskbarElement.checked
+      ? "已设置：不在任务栏/Dock 显示"
+      : "已设置：在任务栏/Dock 显示",
   ));
 
 closeActionElement.addEventListener("change", () =>
