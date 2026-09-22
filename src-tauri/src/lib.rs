@@ -275,17 +275,122 @@ impl AutostartState {
 }
 
 #[cfg(target_os = "macos")]
-fn running_from_app_bundle() -> bool {
+fn app_bundle_path() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|executable| executable.canonicalize().ok())
         .and_then(|executable| executable.ancestors().nth(3).map(Path::to_path_buf))
-        .is_some_and(|bundle| {
+        .filter(|bundle| {
             bundle
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
                 && bundle.join("Contents").is_dir()
         })
+}
+
+#[cfg(target_os = "macos")]
+fn running_from_app_bundle() -> bool {
+    app_bundle_path().is_some()
+}
+
+/// macOS 开机启动的实现方式。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutostartBackend {
+    /// macOS 13+ 且应用已签名：走系统登录项接口（SMAppService），
+    /// 条目由用户在「系统设置 → 通用 → 登录项与扩展」中管理。
+    LoginItem,
+    /// 未签名 / 未以 .app 运行 / macOS 12 及以下：退回 ~/Library/LaunchAgents。
+    ///
+    /// 系统登录项接口要求应用带有效签名，未签名的 bundle 调用
+    /// `registerAndReturnError()` 只会拿到
+    /// `SMAppServiceErrorDomain code=1 "Operation not permitted"`，
+    /// 因此这种情况必须用兼容方式，否则开关点了没有任何效果。
+    LaunchAgent,
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_backend_for(supported: bool, in_bundle: bool, signed: bool) -> AutostartBackend {
+    if supported && in_bundle && signed {
+        AutostartBackend::LoginItem
+    } else {
+        AutostartBackend::LaunchAgent
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_backend() -> AutostartBackend {
+    autostart_backend_for(
+        login_item::is_supported(),
+        running_from_app_bundle(),
+        app_bundle_is_signed(),
+    )
+}
+
+/// 当前 .app 是否带有有效代码签名（ad-hoc 签名同样算有效）。
+///
+/// SMAppService 只接受已签名的应用，所以这里实际跑一次 `codesign --verify`
+/// 探测，而不是要求必须是 Developer ID 证书。
+#[cfg(target_os = "macos")]
+fn app_bundle_is_signed() -> bool {
+    static SIGNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SIGNED.get_or_init(|| {
+        let Some(bundle) = app_bundle_path() else {
+            return false;
+        };
+        Command::new("/usr/bin/codesign")
+            .arg("--verify")
+            .arg(&bundle)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+/// 系统登录项注册失败时的提示。已签名的应用也可能因为系统登录项数据库
+/// 状态异常而注册失败，这时会退回 LaunchAgent，需要把原因告诉用户。
+#[cfg(target_os = "macos")]
+fn login_item_failure() -> Option<String> {
+    static NOTICE: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+    NOTICE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("autostart notice mutex poisoned")
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn note_login_item_failure(error: &str) {
+    static NOTICE: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+    *NOTICE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("autostart notice mutex poisoned") = Some(error.to_string());
+}
+
+#[cfg(target_os = "macos")]
+fn clear_login_item_failure() {
+    static NOTICE: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+    *NOTICE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("autostart notice mutex poisoned") = None;
+}
+
+/// 兼容方式（LaunchAgent）生效时说明为什么没用系统登录项。
+#[cfg(target_os = "macos")]
+fn launch_agent_hint() -> String {
+    if !login_item::is_supported() {
+        return "当前系统版本低于 macOS 13，已改用兼容方式（~/Library/LaunchAgents）实现开机启动"
+            .to_string();
+    }
+    if !running_from_app_bundle() {
+        return "当前未以 .app 形式运行，已改用兼容方式（~/Library/LaunchAgents）实现开机启动"
+            .to_string();
+    }
+    "当前应用没有代码签名，系统登录项接口不可用，已改用兼容方式（~/Library/LaunchAgents）实现开机启动；使用签名版本后可在「系统设置 → 通用 → 登录项与扩展」中管理"
+        .to_string()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -297,12 +402,52 @@ struct SettingsView {
     autostart_hint: Option<String>,
 }
 
+/// 界面提示：先说明系统状态，再说明实际用的是哪种开机启动实现。
+#[cfg(not(target_os = "macos"))]
+fn autostart_hint(state: AutostartState) -> Option<String> {
+    state.hint().map(str::to_string)
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_hint(state: AutostartState) -> Option<String> {
+    macos_autostart_hint(
+        state,
+        autostart_backend(),
+        login_item_failure(),
+        launch_agent_hint(),
+    )
+}
+
+/// 提示语的纯逻辑部分，和运行环境解耦，便于单测。
+#[cfg(target_os = "macos")]
+fn macos_autostart_hint(
+    state: AutostartState,
+    backend: AutostartBackend,
+    login_item_error: Option<String>,
+    compatibility_hint: String,
+) -> Option<String> {
+    // 需要用户在系统设置里勾选时，优先给这条可操作的提示。
+    if state == AutostartState::RequiresApproval {
+        return state.hint().map(str::to_string);
+    }
+    if let Some(error) = login_item_error {
+        return Some(format!(
+            "系统登录项注册失败（{error}），已改用兼容方式（~/Library/LaunchAgents）实现开机启动"
+        ));
+    }
+    // 已经开启但不是通过系统登录项实现的，说明现在用的是兼容方式。
+    if state.is_on() && backend == AutostartBackend::LaunchAgent {
+        return Some(compatibility_hint);
+    }
+    state.hint().map(str::to_string)
+}
+
 impl SettingsView {
     fn new(settings: Settings, state: AutostartState) -> Self {
         Self {
             settings,
             autostart_state: state.as_str(),
-            autostart_hint: state.hint().map(str::to_string),
+            autostart_hint: autostart_hint(state),
         }
     }
 }
@@ -1192,19 +1337,29 @@ mod login_item {
 
 #[cfg(target_os = "macos")]
 fn macos_autostart_state(app: &AppHandle) -> AutostartState {
-    if login_item::is_supported() && running_from_app_bundle() {
-        login_item::state()
-    } else {
-        legacy_autostart_state(app)
+    match autostart_backend() {
+        AutostartBackend::LoginItem => login_item::state(),
+        AutostartBackend::LaunchAgent => legacy_autostart_state(app),
     }
 }
 
 #[cfg(target_os = "macos")]
 fn macos_autostart_set(app: &AppHandle, enabled: bool) -> Result<AutostartState, String> {
-    if login_item::is_supported() && running_from_app_bundle() {
-        login_item::set(enabled)
-    } else {
-        legacy_autostart_set(app, enabled)
+    match autostart_backend() {
+        AutostartBackend::LoginItem => match login_item::set(enabled) {
+            Ok(state) => {
+                clear_login_item_failure();
+                Ok(state)
+            }
+            // 已签名的应用也可能因为系统登录项数据库状态异常而注册失败，
+            // 这时退回 LaunchAgent，保证开机启动开关依然生效。
+            Err(error) => {
+                eprintln!("系统登录项接口调用失败，改用兼容方式: {error}");
+                note_login_item_failure(&error);
+                legacy_autostart_set(app, enabled)
+            }
+        },
+        AutostartBackend::LaunchAgent => legacy_autostart_set(app, enabled),
     }
 }
 
@@ -1375,7 +1530,11 @@ fn view_settings(app: &AppHandle) -> SettingsView {
 
 #[cfg(target_os = "macos")]
 fn cleanup_legacy_autostart(app: &AppHandle) {
-    if macos_autostart_state(app) == AutostartState::Enabled {
+    // 只有系统登录项真正生效时才清理 LaunchAgent 文件，否则会把兼容方式
+    // （未签名 / 未以 .app 运行）下正在使用的自启动项一起删掉。
+    if autostart_backend() == AutostartBackend::LoginItem
+        && login_item::state() == AutostartState::Enabled
+    {
         remove_legacy_launch_agents(app);
     }
 }
@@ -1725,4 +1884,102 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run rEFInd Switcher");
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_login_item_backend_requires_signature() {
+        // 未签名：系统登录项接口只会返回 “Operation not permitted”，必须走兼容方式。
+        assert_eq!(
+            autostart_backend_for(true, true, false),
+            AutostartBackend::LaunchAgent
+        );
+        // 未以 .app 形式运行（例如 tauri dev）：同样不能用系统登录项接口。
+        assert_eq!(
+            autostart_backend_for(true, false, true),
+            AutostartBackend::LaunchAgent
+        );
+        // macOS 12 及以下没有 SMAppService。
+        assert_eq!(
+            autostart_backend_for(false, true, true),
+            AutostartBackend::LaunchAgent
+        );
+        // 已签名的 .app + macOS 13+ 才用系统登录项。
+        assert_eq!(
+            autostart_backend_for(true, true, true),
+            AutostartBackend::LoginItem
+        );
+    }
+
+    #[test]
+    fn macos_autostart_hint_explains_compatibility_mode() {
+        let compatibility = "当前应用没有代码签名".to_string();
+
+        // 兼容方式生效且已开启：提示说明为什么没用系统登录项。
+        assert_eq!(
+            macos_autostart_hint(
+                AutostartState::Enabled,
+                AutostartBackend::LaunchAgent,
+                None,
+                compatibility.clone()
+            ),
+            Some(compatibility.clone())
+        );
+        // 走系统登录项且正常：不需要额外提示。
+        assert_eq!(
+            macos_autostart_hint(
+                AutostartState::Enabled,
+                AutostartBackend::LoginItem,
+                None,
+                compatibility.clone()
+            ),
+            None
+        );
+        // 没开启时不唠叨兼容方式。
+        assert_eq!(
+            macos_autostart_hint(
+                AutostartState::Disabled,
+                AutostartBackend::LaunchAgent,
+                None,
+                compatibility.clone()
+            ),
+            None
+        );
+        // 需要用户在系统设置里批准：优先给可操作的提示。
+        assert_eq!(
+            macos_autostart_hint(
+                AutostartState::RequiresApproval,
+                AutostartBackend::LoginItem,
+                None,
+                compatibility.clone()
+            ),
+            AutostartState::RequiresApproval.hint().map(str::to_string)
+        );
+        // 注册失败后退回兼容方式：把失败原因带出来。
+        let hint = macos_autostart_hint(
+            AutostartState::Enabled,
+            AutostartBackend::LaunchAgent,
+            Some("Operation not permitted (code=1)".to_string()),
+            compatibility,
+        )
+        .expect("应有提示");
+        assert!(hint.contains("Operation not permitted"));
+        assert!(hint.contains("兼容方式"));
+    }
+
+    #[test]
+    fn macos_dev_binary_never_uses_login_item_api() {
+        // 单测二进制不在 .app 内，也没有签名，必须判为兼容方式；
+        // 否则（旧行为）会去调用系统登录项接口并拿到 Operation not permitted。
+        assert!(!running_from_app_bundle());
+        assert!(!app_bundle_is_signed());
+        assert_eq!(autostart_backend(), AutostartBackend::LaunchAgent);
+
+        // 开启状态下界面会说明当前用的是兼容方式。
+        let hint = autostart_hint(AutostartState::Enabled).expect("应有兼容方式提示");
+        assert!(hint.contains("兼容方式"), "实际提示: {hint}");
+    }
 }

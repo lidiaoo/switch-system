@@ -21,7 +21,7 @@
 主窗口「应用设置」区域提供以下设置：
 
 - **开机启动**：登录系统后自动启动应用。
-  - macOS 13 及以上调用系统登录项接口 `SMAppService.mainApp` 注册，条目会出现在「系统设置 → 通用 → 登录项与扩展 → 登入时打开」，应用更新或被移动位置后启动时会自动重新注册；macOS 12 及以下回退为 `~/Library/LaunchAgents/rEFInd Switcher.plist`（早期版本写入的 LaunchAgent 会在启动时自动清理）。
+  - macOS 13 及以上调用系统登录项接口 `SMAppService.mainApp` 注册，条目会出现在「系统设置 → 通用 → 登录项与扩展 → 登入时打开」，应用更新或被移动位置后启动时会自动重新注册。该接口要求应用带有效代码签名，因此 `tauri.conf.json` 默认配置了 ad-hoc 签名（`bundle.macOS.signingIdentity = "-"`）；未签名、未以 `.app` 形式运行或 macOS 12 及以下时自动退回 `~/Library/LaunchAgents/rEFInd Switcher.plist`，界面会提示当前使用的是兼容方式。签名版本生效后，早期版本遗留的 LaunchAgent 会在启动时自动清理，避免重复拉起。
   - Windows 写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 写入 `~/.config/autostart`。
   - Linux 即使以 root 执行，也会识别 `SUDO_USER` / `PKEXEC_UID`，并把 desktop 文件写回实际登录用户的 `~/.config/autostart`。
   - Linux 通用二进制/AppImage 的路径会被写入 desktop 文件；桌面会话启动该程序后仍以当前登录用户运行。
@@ -132,4 +132,4 @@ sudo chown -R "$(id -un):$(id -gn)" ~/.config/com.example.refind-switcher
 ## 注意
 
 - 应用只修改 rEFInd 的 `PreviousBoot` 嗅探状态，不会直接调用系统重启 API。
-- 正式发布前建议替换品牌图标并补充签名配置。
+- 正式发布前建议替换品牌图标，并把 `bundle.macOS.signingIdentity` 换成 Apple Developer ID 证书（或用 `APPLE_SIGNING_IDENTITY` 环境变量覆盖）。ad-hoc 签名只保证系统登录项接口和本地运行可用，未做公证，首次打开仍需在「隐私与安全性」中放行。
