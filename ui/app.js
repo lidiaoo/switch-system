@@ -13,6 +13,7 @@ const unmountTemporaryElement = document.querySelector("#unmount-temporary");
 const settingsMessageElement = document.querySelector("#settings-message");
 const autostartStateElement = document.querySelector("#autostart-state");
 const loginItemsElement = document.querySelector("#login-items");
+const restartElement = document.querySelector("#restart-system");
 
 const autostartStateLabels = new Map([
   ["enabled", "已加入系统登录项"],
@@ -192,8 +193,34 @@ loginItemsElement.addEventListener("click", async () => {
   }
 });
 
+async function restartSystem() {
+  restartElement.disabled = true;
+  messageElement.textContent = "正在请求重启…（macOS/Linux 需要管理员授权）";
+  try {
+    await invoke("restart_system");
+  } catch (error) {
+    messageElement.textContent = String(error);
+    restartElement.disabled = false;
+  }
+}
+
+restartElement.addEventListener("click", restartSystem);
+
 (async () => {
   await listen("status-changed", (event) => render(event.payload));
+
+  // 托盘菜单改了设置也要立刻反映到主窗口，两边始终一致。
+  await listen("settings-changed", (event) => {
+    renderSettings(event.payload, settingsMessageElement.textContent || "已与托盘菜单同步");
+  });
+
+  // 重启结果（成功只是短暂显示，失败会给出原因）。
+  await listen("restart-result", (event) => {
+    const { message } = event.payload;
+    messageElement.textContent = message || "";
+    restartElement.disabled = false;
+  });
+
   render(await invoke("current_status"));
   await loadSettings();
   await invoke("refresh");

@@ -7,6 +7,7 @@
 - Windows / Linux / macOS 系统托盘菜单直接切换下次启动系统。
 - 主窗口不占用 Windows 任务栏、Linux 任务栏或 macOS Dock，仅通过系统托盘常驻。
 - 开机启动开关：登录系统后自动启动并常驻托盘。
+- 托盘菜单与主窗口都有「重启系统」，按平台选择重启方式（macOS 走系统管理员授权，Linux 优先免密 `systemctl`、需要时用 pkexec 图形授权，Windows 用 `shutdown /r`）。
 - 可配置点击窗口 ❌ 时是最小化到托盘还是退出程序。
 - Linux 提供 `deb`、`rpm` 和 `AppImage`；macOS 支持 Intel、Apple Silicon 和通用二进制。
 - 自动扫描已挂载的 `EFI/refind/vars` 目录。
@@ -29,7 +30,24 @@
 - **启动时隐藏主界面**：登录/启动后只在托盘待命，不直接打开主窗口。
 - **点击窗口 ❌ 时**：`最小化到托盘`（隐藏主窗口继续后台运行，托盘菜单「显示主窗口」可恢复）或 `退出程序`（同时退出托盘）。
 
-设置持久化在应用配置目录的 `settings.json` 中。开机启动以系统真实状态为准：在系统设置／登录项里手动修改后，重新打开主窗口会自动同步显示。
+设置持久化在应用配置目录的 `settings.json` 中。**主窗口和托盘菜单是双向联动的**：任何一边改了设置都会立刻保存、重建托盘菜单，并通过 `settings-changed` 事件通知主窗口重绘，两边不会出现“一边勾选、一边没变”的情况。开机启动以系统真实状态为准：在系统设置／登录项里手动修改后，重新打开主窗口会自动同步显示。
+
+## 重启系统
+
+主窗口的「重启系统」按钮和托盘菜单的「重启系统」都走同一套逻辑（`run_restart`），按平台依次尝试：
+
+| 平台 | 方式 |
+| --- | --- |
+| macOS | `osascript -e 'do shell script "/sbin/shutdown -r now" with administrator privileges'`，弹系统自带管理员授权框，应用自身不需要 root |
+| Linux | 先 `systemctl reboot`（本地活动会话下 logind 允许免密），失败再用 `pkexec systemctl reboot` 走图形授权；没有 systemd 的发行版退到 `loginctl reboot` |
+| Windows | `shutdown /r /t 0` |
+
+两条安全约定：
+
+- **只有“程序不存在”才会换下一个候选命令**。如果命令能执行但失败（没有权限、用户取消了授权弹窗），流程立即停手并把原因显示到主窗口——不会“取消授权之后换个方式照样把机器重启”。
+- 重启在后台线程执行（提权弹窗可能停留很久），用原子标志忽略重复点击；失败时自动弹出主窗口显示原因，成功时机器马上就不在了。
+
+需要 macOS 无密码重启时，可以把 `restart_attempts()` 里的候选命令换成 `osascript -e 'tell application "System Events" to restart'`（优雅重启，但需要“自动化”权限，且 ad-hoc 签名每次更新都可能重新弹权限框）。
 
 Linux 中除“开机启动”外，其他应用设置保存失败或恢复原值时，先检查应用配置目录是否属于当前用户：
 

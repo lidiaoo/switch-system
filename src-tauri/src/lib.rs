@@ -3,7 +3,10 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +29,10 @@ const ESP_PARTTYPE: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 const FAT_FILESYSTEMS: [&str; 6] = ["vfat", "fat", "fat12", "fat16", "fat32", "exfat"];
 const SETTINGS_FILE: &str = "settings.json";
 const MAIN_WINDOW_LABEL: &str = "main";
+/// 设置变更事件：托盘菜单改动后推给主窗口，保证两边一致。
+const SETTINGS_CHANGED_EVENT: &str = "settings-changed";
+/// 重启结果事件：把失败原因回传给主窗口。
+const RESTART_RESULT_EVENT: &str = "restart-result";
 
 #[derive(Default)]
 struct AppState {
@@ -450,6 +457,14 @@ impl SettingsView {
             autostart_hint: autostart_hint(state),
         }
     }
+}
+
+/// 重启结果，用于把失败原因回传给主窗口。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestartResult {
+    ok: bool,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -1158,6 +1173,8 @@ fn update_tray_menu(app: &AppHandle) -> tauri::Result<()> {
     menu.append(&close_action_menu)?;
     let refresh = MenuItem::with_id(app, "refresh", "扫描", true, None::<&str>)?;
     menu.append(&refresh)?;
+    let restart = MenuItem::with_id(app, "restart", "重启系统", true, None::<&str>)?;
+    menu.append(&restart)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     menu.append(&quit)?;
     if let Some(tray) = app.tray_by_id("main") {
@@ -1192,6 +1209,7 @@ fn spawn_menu_action(app: &AppHandle, action: &str) {
             );
         }
         "quit" => app.exit(0),
+        "restart" => spawn_restart(&app),
         "linux" | "windows" | "macos" => {
             switch_and_update(&app, &action);
         }
@@ -1528,6 +1546,29 @@ fn view_settings(app: &AppHandle) -> SettingsView {
     SettingsView::new(settings, state)
 }
 
+/// 设置变更后统一入口：重建托盘菜单并通知主窗口。
+///
+/// 主窗口和托盘菜单是两份独立的 UI，任何一边改了设置都必须走这里，
+/// 否则另一边会一直显示旧状态（勾选框和系统真实状态不一致）。
+fn publish_settings(app: &AppHandle) -> SettingsView {
+    let view = view_settings(app);
+    if let Err(error) = update_tray_menu(app) {
+        eprintln!("刷新托盘菜单失败: {error}");
+    }
+    // 记一条日志，方便排查“主窗口/托盘显示不一致”这类问题。
+    eprintln!(
+        "设置已同步：autostart={} start_in_tray={} hide_from_dock_taskbar={} close_action={:?}",
+        view.settings.autostart,
+        view.settings.start_in_tray,
+        view.settings.hide_from_dock_taskbar,
+        view.settings.close_action
+    );
+    if let Err(error) = app.emit(SETTINGS_CHANGED_EVENT, &view) {
+        eprintln!("通知主窗口设置变更失败: {error}");
+    }
+    view
+}
+
 #[cfg(target_os = "macos")]
 fn cleanup_legacy_autostart(app: &AppHandle) {
     // 只有系统登录项真正生效时才清理 LaunchAgent 文件，否则会把兼容方式
@@ -1635,10 +1676,11 @@ fn toggle_autostart_setting(app: &AppHandle) {
         save_settings(app, &settings)
     }) {
         Ok(_) => {
-            let _ = update_tray_menu(app);
+            publish_settings(app);
         }
         Err(error) => {
-            let _ = update_tray_menu(app);
+            // 失败时也要同步一次：让主窗口看到系统里的真实状态和提示。
+            publish_settings(app);
             eprintln!("切换开机启动失败: {error}");
         }
     }
@@ -1657,9 +1699,10 @@ fn update_tray_setting(app: &AppHandle, action: &str, enabled: bool) {
     };
     match save_settings(app, &settings).and_then(|_| apply_result) {
         Ok(()) => {
-            let _ = update_tray_menu(app);
+            publish_settings(app);
         }
         Err(error) => {
+            publish_settings(app);
             eprintln!("切换应用设置失败: {error}");
         }
     }
@@ -1672,8 +1715,223 @@ fn update_close_action_setting(app: &AppHandle, action: &str) {
     let mut settings = stored_settings(app);
     settings.close_action = close_action;
     if save_settings(app, &settings).is_ok() {
-        let _ = update_tray_menu(app);
+        publish_settings(app);
     }
+}
+
+/// 一次重启尝试的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RestartAttemptOutcome {
+    /// 命令执行成功，系统即将重启。
+    Success,
+    /// 系统里没有这个命令，可以换下一个候选。
+    Missing(String),
+    /// 命令存在但执行失败，通常是权限不足或用户取消了授权弹窗。
+    Failed(String),
+}
+
+impl RestartAttemptOutcome {
+    fn describe(&self) -> String {
+        match self {
+            Self::Success => "已提交重启".to_string(),
+            Self::Missing(reason) | Self::Failed(reason) => reason.clone(),
+        }
+    }
+}
+
+/// 一条尝试失败之后该做什么。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartStep {
+    /// 重启已提交，结束。
+    Done,
+    /// 换下一个候选命令（例如发行版里没有 systemctl）。
+    Next,
+    /// 权限不足，用 pkexec 提权重试同一条命令。
+    Escalate,
+    /// 停手：命令能跑但失败了，多半是用户取消了授权，不能换个方式照样重启。
+    Stop,
+}
+
+fn next_restart_step(outcome: &RestartAttemptOutcome, can_escalate: bool) -> RestartStep {
+    match outcome {
+        RestartAttemptOutcome::Success => RestartStep::Done,
+        RestartAttemptOutcome::Missing(_) => RestartStep::Next,
+        RestartAttemptOutcome::Failed(_) if can_escalate => RestartStep::Escalate,
+        RestartAttemptOutcome::Failed(_) => RestartStep::Stop,
+    }
+}
+
+/// 各平台的重启候选命令，按顺序尝试。
+///
+/// macOS 用 AppleScript 弹系统自带的管理员授权框后执行 `shutdown -r now`
+/// （应用本身没有也不需要 root 权限）；Linux 先试免密的 `systemctl reboot`
+/// （本地活动会话下 logind 允许），失败再走 pkexec 图形授权；Windows 用
+/// 自带的 `shutdown /r`。
+#[cfg(target_os = "macos")]
+fn restart_attempts() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![(
+        "osascript",
+        vec![
+            "-e",
+            "do shell script \"/sbin/shutdown -r now\" with administrator privileges",
+        ],
+    )]
+}
+
+#[cfg(target_os = "linux")]
+fn restart_attempts() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("systemctl", vec!["reboot"]),
+        // 没有 systemd 的发行版（elogind 等）用 loginctl。
+        ("loginctl", vec!["reboot"]),
+    ]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn restart_attempts() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![("shutdown", vec!["/r", "/t", "0"])]
+}
+
+/// 需要管理员权限时的等价命令：Linux 用 pkexec 弹图形授权框。
+/// 其他平台没有额外方案（macOS 的候选命令本身就是提权的）。
+fn escalate_restart(program: &str, args: &[&str]) -> Option<(&'static str, Vec<String>)> {
+    #[cfg(target_os = "linux")]
+    {
+        if is_root() {
+            return None;
+        }
+        let mut escalated = Vec::with_capacity(args.len() + 1);
+        escalated.push(program.to_string());
+        escalated.extend(args.iter().map(|arg| arg.to_string()));
+        Some(("pkexec", escalated))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, args);
+        None
+    }
+}
+
+fn run_restart_command(program: &str, args: &[&str]) -> RestartAttemptOutcome {
+    let display = format!("{program} {}", args.join(" "));
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => RestartAttemptOutcome::Success,
+        Ok(output) => {
+            let code = output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "未知".to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if detail.is_empty() {
+                RestartAttemptOutcome::Failed(format!("{display} 失败（退出码 {code}）"))
+            } else {
+                RestartAttemptOutcome::Failed(format!("{display} 失败（退出码 {code}）：{detail}"))
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            RestartAttemptOutcome::Missing(format!("{display}：{error}"))
+        }
+        Err(error) => RestartAttemptOutcome::Failed(format!("{display} 无法执行: {error}")),
+    }
+}
+
+fn run_restart() -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (program, args) in restart_attempts() {
+        let outcome = run_restart_command(program, &args);
+        let escalation = escalate_restart(program, &args);
+        match next_restart_step(&outcome, escalation.is_some()) {
+            RestartStep::Done => {
+                eprintln!("已通过 {program} 提交重启");
+                return Ok(());
+            }
+            RestartStep::Next => {
+                failures.push(outcome.describe());
+                continue;
+            }
+            RestartStep::Escalate => {
+                let Some((escalated_program, escalated_args)) = escalation else {
+                    return Err(format!("重启失败：{}", outcome.describe()));
+                };
+                let escalated_args = escalated_args
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                return match run_restart_command(escalated_program, &escalated_args) {
+                    RestartAttemptOutcome::Success => {
+                        eprintln!("已通过 {escalated_program} 提交重启");
+                        Ok(())
+                    }
+                    other => Err(format!(
+                        "重启需要管理员授权，提权未完成：{}",
+                        other.describe()
+                    )),
+                };
+            }
+            RestartStep::Stop => {
+                return Err(format!(
+                    "重启失败：{}（可能是没有权限或取消了授权）",
+                    outcome.describe()
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "没有可用的重启命令（已尝试：{}）",
+        failures.join("；")
+    ))
+}
+
+/// 后台重启，并把结果推给主窗口。
+///
+/// 提权弹窗可能停很久，所以不能在命令线程里同步跑；同时用原子标志避免
+/// 连点两次提交两个重启请求。
+fn spawn_restart(app: &AppHandle) {
+    static RESTARTING: AtomicBool = AtomicBool::new(false);
+    if RESTARTING.swap(true, Ordering::SeqCst) {
+        eprintln!("已有重启请求在处理中，忽略重复点击");
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = run_restart();
+        match result {
+            Ok(()) => {
+                let _ = app.emit(
+                    RESTART_RESULT_EVENT,
+                    RestartResult {
+                        ok: true,
+                        message: "已提交重启，系统即将重启".to_string(),
+                    },
+                );
+            }
+            Err(error) => {
+                eprintln!("重启失败: {error}");
+                // 成功时系统马上就不在了，失败时允许再点一次。
+                RESTARTING.store(false, Ordering::SeqCst);
+                let _ = app.emit(
+                    RESTART_RESULT_EVENT,
+                    RestartResult {
+                        ok: false,
+                        message: error.clone(),
+                    },
+                );
+                // 从托盘触发时主窗口可能没打开，显示出来让用户看到失败原因。
+                // 窗口/激活策略属于 AppKit 主线程操作，这里显式切回主线程。
+                let window_app = app.clone();
+                if let Err(error) = app.run_on_main_thread(move || show_main_window(&window_app)) {
+                    eprintln!("显示主窗口失败: {error}");
+                }
+            }
+        }
+    });
 }
 
 fn apply_dock_taskbar_visibility(app: &AppHandle, hide: bool) -> Result<(), String> {
@@ -1731,8 +1989,8 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<SettingsView, String> 
     let state = autostart_set(&app, enabled)?;
     let mut settings = stored_settings(&app);
     settings.autostart = state.is_on();
-    let settings = save_settings(&app, &settings)?;
-    Ok(SettingsView::new(settings, state))
+    save_settings(&app, &settings)?;
+    Ok(publish_settings(&app))
 }
 
 #[tauri::command]
@@ -1757,7 +2015,7 @@ fn set_close_action(app: AppHandle, action: String) -> Result<SettingsView, Stri
     let mut settings = stored_settings(&app);
     settings.close_action = close_action;
     save_settings(&app, &settings)?;
-    Ok(view_settings(&app))
+    Ok(publish_settings(&app))
 }
 
 #[tauri::command]
@@ -1765,7 +2023,7 @@ fn set_start_in_tray(app: AppHandle, enabled: bool) -> Result<SettingsView, Stri
     let mut settings = stored_settings(&app);
     settings.start_in_tray = enabled;
     save_settings(&app, &settings)?;
-    Ok(view_settings(&app))
+    Ok(publish_settings(&app))
 }
 
 #[tauri::command]
@@ -1774,8 +2032,13 @@ fn set_hide_from_dock_taskbar(app: AppHandle, enabled: bool) -> Result<SettingsV
     settings.hide_from_dock_taskbar = enabled;
     save_settings(&app, &settings)?;
     apply_dock_taskbar_visibility(&app, enabled)?;
-    update_tray_menu(&app).map_err(|error| error.to_string())?;
-    Ok(view_settings(&app))
+    Ok(publish_settings(&app))
+}
+
+/// 重启系统。提权弹窗可能等很久，所以立刻返回，结果通过事件推送。
+#[tauri::command]
+fn restart_system(app: AppHandle) {
+    spawn_restart(&app);
 }
 
 pub fn run() {
@@ -1880,7 +2143,8 @@ pub fn run() {
             open_login_items_settings,
             set_close_action,
             set_start_in_tray,
-            set_hide_from_dock_taskbar
+            set_hide_from_dock_taskbar,
+            restart_system
         ])
         .run(tauri::generate_context!())
         .expect("failed to run rEFInd Switcher");
@@ -1981,5 +2245,96 @@ mod tests {
         // 开启状态下界面会说明当前用的是兼容方式。
         let hint = autostart_hint(AutostartState::Enabled).expect("应有兼容方式提示");
         assert!(hint.contains("兼容方式"), "实际提示: {hint}");
+    }
+
+    #[test]
+    fn restart_attempt_chain_stops_after_cancelled_authorization() {
+        use RestartAttemptOutcome::{Failed, Missing, Success};
+
+        // 命令执行成功：结束。
+        assert_eq!(next_restart_step(&Success, true), RestartStep::Done);
+        // 系统里没有这个命令：换下一个候选（例如没有 systemd 的发行版）。
+        assert_eq!(
+            next_restart_step(&Missing("没有 systemctl".to_string()), true),
+            RestartStep::Next
+        );
+        // 权限不足且还有提权方案：用 pkexec 重试。
+        assert_eq!(
+            next_restart_step(
+                &Failed("Interactive authentication required".to_string()),
+                true
+            ),
+            RestartStep::Escalate
+        );
+        // 提权也失败了（多半是用户取消授权）：停手，
+        // 不能“取消授权之后换个方式照样把机器重启了”。
+        assert_eq!(
+            next_restart_step(&Failed("Request dismissed".to_string()), false),
+            RestartStep::Stop
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_restart_uses_administrator_privileges() {
+        let attempts = restart_attempts();
+        assert_eq!(attempts.len(), 1, "macOS 只走一条提权路径");
+        let (program, args) = &attempts[0];
+        assert_eq!(*program, "osascript");
+        let script = args.join(" ");
+        assert!(
+            script.contains("administrator privileges"),
+            "实际脚本: {script}"
+        );
+        assert!(
+            script.contains("/sbin/shutdown -r now"),
+            "实际脚本: {script}"
+        );
+        // 候选命令本身就带管理员授权，不需要再提权一层。
+        assert!(escalate_restart(program, args.as_slice()).is_none());
+    }
+
+    #[test]
+    fn restart_command_runner_classifies_results() {
+        // 真的去执行进程，验证成功/找不到命令/失败三种判定和 stderr 捕获。
+        assert_eq!(
+            run_restart_command("/usr/bin/true", &[]),
+            RestartAttemptOutcome::Success
+        );
+        assert!(matches!(
+            run_restart_command("/nonexistent-restart-binary", &[]),
+            RestartAttemptOutcome::Missing(_)
+        ));
+
+        // 模拟“用户取消授权”：退出码非零 + stderr 说明，必须归类为失败并带上原因。
+        let outcome =
+            run_restart_command("/bin/sh", &["-c", "echo 'Request dismissed' >&2; exit 126"]);
+        assert!(matches!(outcome, RestartAttemptOutcome::Failed(_)));
+        let description = outcome.describe();
+        assert!(description.contains("126"), "应带退出码: {description}");
+        assert!(
+            description.contains("Request dismissed"),
+            "应带 stderr: {description}"
+        );
+    }
+
+    #[test]
+    fn frontend_listens_to_backend_events() {
+        // 前后端通过事件名和命令名对接，任何一边改名了都会让联动失效，
+        // 这里直接对着前端源码断言契约。
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/app.js");
+        let Ok(source) = fs::read_to_string(&path) else {
+            return;
+        };
+        for event in [SETTINGS_CHANGED_EVENT, RESTART_RESULT_EVENT] {
+            assert!(
+                source.contains(&format!("listen(\"{event}\"")),
+                "前端没有监听 {event}"
+            );
+        }
+        assert!(
+            source.contains("invoke(\"restart_system\")"),
+            "前端没有调用 restart_system 命令"
+        );
     }
 }

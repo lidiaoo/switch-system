@@ -123,6 +123,12 @@ input {
   gap: 8px;
 }
 
+.system-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
 #message {
   min-height: 20px;
   margin: 0;
