@@ -1129,11 +1129,17 @@ mod login_item {
             return AutostartState::Unavailable;
         };
         let status = unsafe { service.status() };
+        // SMAppServiceStatus 枚举: 0=NotRegistered, 1=Enabled, 2=RequiresApproval,
+        // 3=NotFound。应用被更新或移动后，旧注册会短暂返回 NotFound(3)；
+        // 不能把它当作 Unavailable（会误导为“未以 .app 运行”），
+        // 应视为未注册，让注册流程/启动自愈重新注册。
         if status == SMAppServiceStatus::Enabled {
             AutostartState::Enabled
         } else if status == SMAppServiceStatus::RequiresApproval {
             AutostartState::RequiresApproval
-        } else if status == SMAppServiceStatus::NotRegistered {
+        } else if status == SMAppServiceStatus::NotRegistered
+            || status == SMAppServiceStatus::NotFound
+        {
             AutostartState::Disabled
         } else {
             AutostartState::Unavailable
@@ -1142,13 +1148,19 @@ mod login_item {
 
     pub fn set(enabled: bool) -> Result<AutostartState, String> {
         let service = main_app()?;
-        let result = unsafe {
+        let mut result = unsafe {
             if enabled {
                 service.registerAndReturnError()
             } else {
                 service.unregisterAndReturnError()
             }
         };
+        // 应用被更新/替换后，旧注册可能处于失效状态，直接注册会失败；
+        // 先注销失效的旧注册再重试一次（Apple 推荐的恢复方式）。
+        if result.is_err() && enabled {
+            let _ = unsafe { service.unregisterAndReturnError() };
+            result = unsafe { service.registerAndReturnError() };
+        }
         let state = state();
         match result {
             Ok(()) => Ok(state),
